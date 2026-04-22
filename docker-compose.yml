@@ -4,11 +4,11 @@ services:
     environment:
       - WORKER_TOKEN=${WORKER_TOKEN}
       - SUPABASE_URL=${SUPABASE_URL}
-      - REDIS_URL=${REDIS_URL}
+      - REDIS_URL=redis://redis:6379
     restart: unless-stopped
-    networks:
-      - coolify
+    depends_on:
+      - redis
 
-networks:
-  coolify:
-    external: true
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
