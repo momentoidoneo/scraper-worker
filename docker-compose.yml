@@ -2,7 +2,7 @@ services:
   worker:
     build: .
     ports:
-      - "3000:3000"
+      - "3030:3000"
     environment:
       - WORKER_TOKEN=${WORKER_TOKEN}
       - SUPABASE_URL=${SUPABASE_URL}
