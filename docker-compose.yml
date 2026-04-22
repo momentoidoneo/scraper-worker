@@ -1,11 +1,12 @@
 services:
   worker:
     build: .
+    ports:
+      - "3000:3000"
     environment:
       - WORKER_TOKEN=${WORKER_TOKEN}
       - SUPABASE_URL=${SUPABASE_URL}
       - REDIS_URL=redis://redis:6379
-      - SERVICE_FQDN_WORKER=https://elmapa.duckdns.org
     restart: unless-stopped
     depends_on:
       - redis
