@@ -5,7 +5,7 @@ services:
       - WORKER_TOKEN=${WORKER_TOKEN}
       - SUPABASE_URL=${SUPABASE_URL}
       - REDIS_URL=redis://redis:6379
-      - SERVICE_FQDN_WORKER_3000
+      - SERVICE_FQDN_WORKER=https://elmapa.duckdns.org
     restart: unless-stopped
     depends_on:
       - redis
