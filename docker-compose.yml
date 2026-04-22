@@ -6,3 +6,9 @@ services:
       - SUPABASE_URL=${SUPABASE_URL}
       - REDIS_URL=${REDIS_URL}
     restart: unless-stopped
+    networks:
+      - coolify
+
+networks:
+  coolify:
+    external: true
