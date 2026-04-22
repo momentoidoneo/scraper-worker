@@ -1,86 +1,118 @@
-import { newContext, humanDelay, humanScroll } from "../browser.js";
+import { chromium, type Browser, type BrowserContext } from "playwright";
+import { buildHabitacliaUrl, type SearchParams } from "../lib/url-builder";
+import { getProxyConfigFor } from "../lib/proxy";
 
-type Listing = {
+export type Listing = {
+  id: string;
   portal: "habitaclia";
-  external_id: string;
+  title: string;
+  price: number | null;
   url: string;
-  title?: string;
   raw?: any;
 };
 
-const PORTAL = "habitaclia";
+const UA =
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 " +
+  "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
-export async function scrapeHabitaclia(
-  params: Record<string, any>,
-  onBatch: (batch: Listing[]) => Promise<void>
-): Promise<Listing[]> {
-  const url = `https://www.habitaclia.com/`;
-  console.log(`[${PORTAL}] goto url=${url} params=${JSON.stringify(params)}`);
+export async function scrapeHabitaclia(params: SearchParams): Promise<Listing[]> {
+  const url = buildHabitacliaUrl(params);
+  const proxy = getProxyConfigFor("habitaclia");
 
-  const { browser, context } = await newContext();
-  const collected: Listing[] = [];
+  console.log(
+    `[habitaclia] goto url=${url} params=${JSON.stringify(params)} proxy=${
+      proxy ? proxy.server : "none"
+    }`
+  );
+
+  let browser: Browser | null = null;
+  let context: BrowserContext | null = null;
   try {
+    browser = await chromium.launch({
+      headless: true,
+      proxy: proxy
+        ? {
+            server: proxy.server,
+            username: proxy.username,
+            password: proxy.password,
+          }
+        : undefined,
+    });
+    context = await browser.newContext({
+      userAgent: UA,
+      locale: "es-ES",
+      viewport: { width: 1366, height: 900 },
+    });
     const page = await context.newPage();
 
-    const response = await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
-    const status = response?.status() ?? 0;
+    const resp = await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+    const status = resp?.status() ?? 0;
     const finalUrl = page.url();
     const html = await page.content();
-    const htmlLen = html.length;
-    const preview = html.slice(0, 500).replace(/\s+/g, " ");
-    console.log(`[${PORTAL}] status=${status} finalUrl=${finalUrl} htmlBytes=${htmlLen}`);
-    console.log(`[${PORTAL}] htmlPreview=${preview}`);
+    const bytes = Buffer.byteLength(html, "utf8");
+
+    console.log(`[habitaclia] status=${status} finalUrl=${finalUrl} htmlBytes=${bytes}`);
+    console.log(`[habitaclia] htmlPreview=${html.slice(0, 500).replace(/\n/g, " ")}`);
 
     const lower = html.toLowerCase();
-    const blockHints = [
-      "captcha", "datadome", "are you a human", "acceso denegado",
-      "access denied", "px-captcha", "cf-chl", "incapsula",
-    ].filter((h) => lower.includes(h));
+    const blockHints: string[] = [];
+    if (lower.includes("captcha")) blockHints.push("captcha");
+    if (lower.includes("datadome")) blockHints.push("datadome");
+    if (status === 403 || status === 429) blockHints.push(`http-${status}`);
     if (blockHints.length) {
-      console.warn(`[${PORTAL}] blockHints=${blockHints.join("|")}`);
+      console.log(`[habitaclia] blockHints=${blockHints.join("|")}`);
     }
 
-    const captcha = await page.$('iframe[src*="hcaptcha"], iframe[src*="recaptcha"]');
-    if (captcha) {
-      console.error(`[${PORTAL}] captcha element detected, aborting`);
-      throw new Error("captcha_blocked");
+    // Habitaclia: combinamos selectores actuales y antiguos.
+    const selector =
+      "article.list-item-container, article.list-item, li.list-item-container, [class*='list-item-container']";
+    const nodes = await page.$$(selector);
+    console.log(`[habitaclia] selector="${selector}" matchedNodes=${nodes.length}`);
+
+    const listings: Listing[] = [];
+    for (const node of nodes) {
+      try {
+        const id =
+          (await node.getAttribute("data-id")) ||
+          (await node.getAttribute("id")) ||
+          "";
+        const linkEl = await node.$("a[href*='.htm']");
+        const href = (await linkEl?.getAttribute("href")) || "";
+        const title =
+          ((await (await node.$("h3, h2, .list-item-title, [class*='title']"))?.innerText()) || "").trim();
+
+        const priceEl = await node.$(".list-item-price, [class*='price']");
+        const priceText = (await priceEl?.innerText())?.replace(/[^\d]/g, "") || "";
+        const price = priceText ? Number(priceText) : null;
+
+        if (href || title) {
+          const finalId = id || href.split("/").pop()?.replace(".htm", "") || crypto.randomUUID();
+          listings.push({
+            id: finalId,
+            portal: "habitaclia",
+            title: title || "(sin título)",
+            price,
+            url: href.startsWith("http") ? href : `https://www.habitaclia.com/${href.replace(/^\//, "")}`,
+          });
+        }
+      } catch (e) {
+        console.log(`[habitaclia] card parse error: ${(e as Error).message}`);
+      }
     }
 
-    await humanDelay(1000, 2500);
-    await humanScroll(page);
-
-    const selector = "article.list-item-container";
-    const rawCount = await page.locator(selector).count().catch(() => 0);
-    console.log(`[${PORTAL}] selector="${selector}" matchedNodes=${rawCount}`);
-
-    const cards = await page.$$eval(selector, (els: any[]) =>
-      els.map((el) => ({
-        external_id: el.getAttribute("data-id") ?? "",
-        url: (el.querySelector("a.list-item-title") as HTMLAnchorElement | null)?.href ?? "",
-        title: el.querySelector("a.list-item-title")?.textContent?.trim() ?? "",
-      }))
-    );
-    console.log(`[${PORTAL}] extractedCards=${cards.length} withId=${cards.filter((c: any) => c.external_id).length}`);
-
-    const batch: Listing[] = cards
-      .filter((c: any) => c.external_id)
-      .map((c: any) => ({ portal: "habitaclia" as const, ...c }));
-
-    if (batch.length) {
-      collected.push(...batch);
-      await onBatch(batch);
-      console.log(`[${PORTAL}] emitted batch size=${batch.length}`);
-    } else {
-      console.warn(`[${PORTAL}] no listings extracted (selector may be stale or page is a captcha/empty shell)`);
+    console.log(`[habitaclia] extractedCards=${nodes.length} withId=${listings.length}`);
+    if (listings.length === 0) {
+      console.log(
+        `[habitaclia] no listings extracted (selector may be stale or page is a captcha/empty shell)`
+      );
     }
-  } catch (e) {
-    const err = e instanceof Error ? `${e.message}\n${e.stack}` : String(e);
-    console.error(`[${PORTAL}] EXCEPTION ${err}`);
-    throw e;
+    console.log(`[habitaclia] finished collected=${listings.length}`);
+    return listings;
+  } catch (err) {
+    console.error(`[habitaclia] FATAL`, err);
+    throw err;
   } finally {
-    await context.close();
-    await browser.close();
-    console.log(`[${PORTAL}] finished collected=${collected.length}`);
+    await context?.close().catch(() => {});
+    await browser?.close().catch(() => {});
   }
-  return collected;
 }
