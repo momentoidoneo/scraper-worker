@@ -1,11 +1,8 @@
-# Solo para desarrollo local. En Coolify, Redis se añade como recurso aparte.
-version: "3.9"
 services:
-  redis:
-    image: redis:7-alpine
-    ports: ["6379:6379"]
   worker:
     build: .
-    ports: ["3000:3000"]
-    env_file: .env
-    depends_on: [redis]
+    environment:
+      - WORKER_TOKEN=${WORKER_TOKEN}
+      - SUPABASE_URL=${SUPABASE_URL}
+      - REDIS_URL=${REDIS_URL}
+    restart: unless-stopped
