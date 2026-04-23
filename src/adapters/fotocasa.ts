@@ -1,6 +1,6 @@
 import { chromium, type Browser, type BrowserContext } from "playwright";
-import { buildFotocasaUrl, type SearchParams } from "../lib/url-builder";
-import { getProxyConfigFor } from "../lib/proxy";
+import { buildFotocasaUrl, type SearchParams } from "../lib/url-builder.js";
+import { getProxyConfigFor } from "../lib/proxy.js";
 
 export type Listing = {
   id: string;
@@ -63,8 +63,6 @@ export async function scrapeFotocasa(params: SearchParams): Promise<Listing[]> {
       console.log(`[fotocasa] blockHints=${blockHints.join("|")}`);
     }
 
-    // Fotocasa: cards de resultados.
-    // Combinamos varios selectores conocidos para resistir cambios de markup.
     const selector =
       "[data-test='listing-item'], article.re-Searchresult-item, [data-cy='listing-item'], div.re-CardPackMinimal";
     const nodes = await page.$$(selector);
