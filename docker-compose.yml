@@ -4,8 +4,12 @@ services:
     ports:
       - "3030:3000"
     environment:
+      - PORT=3000
       - WORKER_TOKEN=${WORKER_TOKEN}
       - SUPABASE_URL=${SUPABASE_URL}
+      - PROXY_URL=${PROXY_URL}
+      - PROXY_USERNAME=${PROXY_USERNAME}
+      - PROXY_PASSWORD=${PROXY_PASSWORD}
       - REDIS_URL=redis://redis:6379
     restart: unless-stopped
     depends_on:
