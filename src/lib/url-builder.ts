@@ -23,7 +23,23 @@ export type SearchParams = {
 export function buildIdealistaUrl(p: SearchParams): string {
   const op = p.operation === "alquiler" ? "alquiler-viviendas" : "venta-viviendas";
   const slug = slugifyCity(p.city);
-  // Idealista usa "ciudad-provincia". Si solo tenemos ciudad, repetimos
-  // (funciona para capitales de provincia: barcelona-barcelona, madrid-madrid...)
   return `https://www.idealista.com/${op}/${slug}-${slug}/`;
+}
+
+// --- FOTOCASA ---
+// https://www.fotocasa.es/es/comprar/viviendas/barcelona-capital/todas-las-zonas/l
+export function buildFotocasaUrl(p: SearchParams): string {
+  const op = p.operation === "alquiler" ? "alquiler" : "comprar";
+  const type = p.property_type === "casa" ? "casas" : "viviendas";
+  const slug = slugifyCity(p.city);
+  return `https://www.fotocasa.es/es/${op}/${type}/${slug}-capital/todas-las-zonas/l`;
+}
+
+// --- HABITACLIA ---
+// https://www.habitaclia.com/comprar-vivienda-en-barcelona.htm
+export function buildHabitacliaUrl(p: SearchParams): string {
+  const op = p.operation === "alquiler" ? "alquiler" : "comprar";
+  const type = p.property_type === "casa" ? "casa" : "vivienda";
+  const slug = slugifyCity(p.city);
+  return `https://www.habitaclia.com/${op}-${type}-en-${slug}.htm`;
 }
