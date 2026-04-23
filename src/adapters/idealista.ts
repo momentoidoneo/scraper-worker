@@ -1,6 +1,6 @@
 import { chromium, type Browser, type BrowserContext } from "playwright";
-import { buildIdealistaUrl, type SearchParams } from "../lib/url-builder";
-import { getProxyConfigFor } from "../lib/proxy";
+import { buildIdealistaUrl, type SearchParams } from "../lib/url-builder.js";
+import { getProxyConfigFor } from "../lib/proxy.js";
 
 export type Listing = {
   id: string;
@@ -64,7 +64,6 @@ export async function scrapeIdealista(params: SearchParams): Promise<Listing[]> 
       console.log(`[idealista] blockHints=${blockHints.join("|")}`);
     }
 
-    // Idealista usa article.item dentro de la lista de resultados.
     const selector = "article.item";
     const nodes = await page.$$(selector);
     console.log(`[idealista] selector="${selector}" matchedNodes=${nodes.length}`);
