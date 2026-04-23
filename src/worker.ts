@@ -70,4 +70,6 @@ export function startWorker() {
   );
 
   worker.on("failed", (job, err) => console.error(`[worker] failed job=${job?.id}\n${fmtErr(err)}`));
-  worker.on("error", (err) => console.
+    worker.on("error", (err) => console.error(`[worker] worker-error\n${fmtErr(err)}`));
+}
+
