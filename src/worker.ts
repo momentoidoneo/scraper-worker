@@ -36,14 +36,13 @@ export function startWorker() {
           console.log(`[worker] portal=${portal} -> running`);
           try {
             const results = await Promise.race([
-              adapters[portal](params, async (batch) => {
-                progress[portal].count += batch.length;
-                await ingestResults({ jobId, tenantId, results: batch, progress, status: "running" });
-              }),
+              adapters[portal](params),
               new Promise<never>((_, rej) => setTimeout(() => rej(new Error("portal_timeout")), TIMEOUT)),
             ]);
             progress[portal].status = "done";
-            progress[portal].count = results.length || progress[portal].count;
+            progress[portal].count = results.length;
+            // Ingest results once at the end of each portal
+            await ingestResults({ jobId, tenantId, results, progress, status: "running" });
             console.log(`[worker] portal=${portal} -> done count=${progress[portal].count} ms=${Date.now() - t0}`);
           } catch (portalErr) {
             progress[portal].status = "error";
