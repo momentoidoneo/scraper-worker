@@ -1,6 +1,6 @@
 import { chromium, type Browser, type BrowserContext } from "playwright";
-import { buildHabitacliaUrl, type SearchParams } from "../lib/url-builder";
-import { getProxyConfigFor } from "../lib/proxy";
+import { buildHabitacliaUrl, type SearchParams } from "../lib/url-builder.js";
+import { getProxyConfigFor } from "../lib/proxy.js";
 
 export type Listing = {
   id: string;
@@ -63,7 +63,6 @@ export async function scrapeHabitaclia(params: SearchParams): Promise<Listing[]>
       console.log(`[habitaclia] blockHints=${blockHints.join("|")}`);
     }
 
-    // Habitaclia: combinamos selectores actuales y antiguos.
     const selector =
       "article.list-item-container, article.list-item, li.list-item-container, [class*='list-item-container']";
     const nodes = await page.$$(selector);
