@@ -4,6 +4,7 @@ import { ingestResults } from "./ingest.js";
 import { scrapeIdealista } from "./adapters/idealista.js";
 import { scrapeFotocasa } from "./adapters/fotocasa.js";
 import { scrapeHabitaclia } from "./adapters/habitaclia.js";
+import type { SearchParams } from "./lib/url-builder.js";
 
 const MAX = parseInt(process.env.MAX_CONCURRENT_JOBS ?? "3", 10);
 const TIMEOUT = parseInt(process.env.JOB_TIMEOUT_MS ?? "300000", 10);
@@ -23,7 +24,9 @@ export function startWorker() {
   const worker = new Worker<ScrapeJobData>(
     "scrape",
     async (job) => {
-      const { jobId, tenantId, params, portals } = job.data;
+      const { jobId, tenantId, portals } = job.data;
+      const params = job.data.params as SearchParams;
+
       console.log(`[worker] start job=${jobId} tenant=${tenantId} portals=${portals.join(",")} params=${JSON.stringify(params)}`);
 
       const progress: Record<string, { status: string; count: number }> = {};
@@ -41,13 +44,11 @@ export function startWorker() {
             ]);
             progress[portal].status = "done";
             progress[portal].count = results.length;
-            // Ingest results once at the end of each portal
             await ingestResults({ jobId, tenantId, results, progress, status: "running" });
             console.log(`[worker] portal=${portal} -> done count=${progress[portal].count} ms=${Date.now() - t0}`);
           } catch (portalErr) {
             progress[portal].status = "error";
             console.error(`[worker] portal=${portal} -> ERROR ms=${Date.now() - t0}\n${fmtErr(portalErr)}`);
-            // Continue with the next portal instead of aborting the whole job
             await ingestResults({
               jobId, tenantId, results: [], progress, status: "running",
               error: `${portal}: ${portalErr instanceof Error ? portalErr.message : String(portalErr)}`,
@@ -69,5 +70,4 @@ export function startWorker() {
   );
 
   worker.on("failed", (job, err) => console.error(`[worker] failed job=${job?.id}\n${fmtErr(err)}`));
-  worker.on("error", (err) => console.error(`[worker] worker-error\n${fmtErr(err)}`));
-}
+  worker.on("error", (err) => console.
