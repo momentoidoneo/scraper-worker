@@ -1,13 +1,23 @@
 import { chromium, type Browser, type BrowserContext } from "playwright";
 import { buildHabitacliaUrl, type SearchParams } from "../lib/url-builder.js";
-import { getProxyConfigFor } from "../lib/proxy.js";
+import { getProxyConfigFor, isLikelyProxyFailure } from "../lib/proxy.js";
 
 export type Listing = {
-  id: string;
+  external_id: string;
   portal: "habitaclia";
   title: string;
   price: number | null;
   url: string;
+  surface_m2?: number | null;
+  rooms?: number | null;
+  bathrooms?: number | null;
+  property_type?: string | null;
+  operation?: string | null;
+  address?: string | null;
+  zone?: string | null;
+  city?: string | null;
+  images?: string[];
+  description?: string | null;
   raw?: any;
 };
 
@@ -15,9 +25,11 @@ const UA =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 " +
   "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
-export async function scrapeHabitaclia(params: SearchParams): Promise<Listing[]> {
+async function scrapeHabitacliaWithProxy(
+  params: SearchParams,
+  proxy: ReturnType<typeof getProxyConfigFor>,
+): Promise<Listing[]> {
   const url = buildHabitacliaUrl(params);
-  const proxy = getProxyConfigFor("habitaclia");
 
   console.log(
     `[habitaclia] goto url=${url} params=${JSON.stringify(params)} proxy=${
@@ -46,6 +58,7 @@ export async function scrapeHabitaclia(params: SearchParams): Promise<Listing[]>
     const page = await context.newPage();
 
     const resp = await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+    await page.waitForTimeout(1500);
     const status = resp?.status() ?? 0;
     const finalUrl = page.url();
     const html = await page.content();
@@ -63,43 +76,73 @@ export async function scrapeHabitaclia(params: SearchParams): Promise<Listing[]>
       console.log(`[habitaclia] blockHints=${blockHints.join("|")}`);
     }
 
-    const selector =
-      "article.list-item-container, article.list-item, li.list-item-container, [class*='list-item-container']";
-    const nodes = await page.$$(selector);
-    console.log(`[habitaclia] selector="${selector}" matchedNodes=${nodes.length}`);
+    const selector = "article.js-list-item[data-id], article.list-item-container[data-id]";
+    const expectedHrefPart = params.operation === "alquiler" || params.operation === "alquiler_temporal" ? "alquiler-" : "comprar-";
+    const rawNodes = await page.$$eval(selector, (nodes) => nodes.length);
+    const listings = (await page.$$eval(selector, (nodes, expectedHrefPart) => {
+      const normalize = (value: string | null | undefined) => (value || "").replace(/\s+/g, " ").trim();
+      const firstMoney = (text: string) => {
+        const match = text.match(/(\d{1,3}(?:\.\d{3})+|\d+)\s*€/);
+        return match ? Number(match[1].replace(/\./g, "")) : null;
+      };
+      const firstNumber = (text: string, pattern: RegExp) => {
+        const match = text.match(pattern);
+        if (!match) return null;
+        const parsed = Number(match[1].replace(",", "."));
+        return Number.isFinite(parsed) ? parsed : null;
+      };
+      const absolute = (href: string) => {
+        if (href.startsWith("http")) return href;
+        if (href.startsWith("//")) return `https:${href}`;
+        return `https://www.habitaclia.com/${href.replace(/^\//, "")}`;
+      };
+      const seen = new Set<string>();
+      const results: Array<Record<string, unknown>> = [];
 
-    const listings: Listing[] = [];
-    for (const node of nodes) {
-      try {
+      for (const node of nodes) {
+        const detailLinks = Array.from(node.querySelectorAll("a[href*='.htm']")) as HTMLAnchorElement[];
+        const titleLink =
+          detailLinks.find((link) => {
+            const href = link.getAttribute("href") || "";
+            return href.includes(expectedHrefPart) && !href.includes("/inmobiliaria-") && normalize(link.textContent).length > 0;
+          }) || null;
+        const href = node.getAttribute("data-href") || titleLink?.getAttribute("href") || "";
+        if (!href.includes(expectedHrefPart)) continue;
+
         const id =
-          (await node.getAttribute("data-id")) ||
-          (await node.getAttribute("id")) ||
+          node.getAttribute("data-id") ||
+          node.id?.replace(/^id/, "") ||
+          href.match(/-i(\d+)\.htm/)?.[1] ||
           "";
-        const linkEl = await node.$("a[href*='.htm']");
-        const href = (await linkEl?.getAttribute("href")) || "";
-        const title =
-          ((await (await node.$("h3, h2, .list-item-title, [class*='title']"))?.innerText()) || "").trim();
+        if (!id || seen.has(id)) continue;
 
-        const priceEl = await node.$(".list-item-price, [class*='price']");
-        const priceText = (await priceEl?.innerText())?.replace(/[^\d]/g, "") || "";
-        const price = priceText ? Number(priceText) : null;
+        const text = normalize(node.textContent);
+        const title = normalize(titleLink?.textContent) || normalize((node.querySelector("img[alt]") as HTMLImageElement | null)?.alt) || "(sin título)";
+        const images = Array.from(node.querySelectorAll("img"))
+          .map((img) => img.getAttribute("src") || img.getAttribute("data-src") || "")
+          .filter((src) => src && /habimg|habitaclia/i.test(src))
+          .map((src) => (src.startsWith("//") ? `https:${src}` : src));
 
-        if (href || title) {
-          const finalId = id || href.split("/").pop()?.replace(".htm", "") || crypto.randomUUID();
-          listings.push({
-            id: finalId,
-            portal: "habitaclia",
-            title: title || "(sin título)",
-            price,
-            url: href.startsWith("http") ? href : `https://www.habitaclia.com/${href.replace(/^\//, "")}`,
-          });
-        }
-      } catch (e) {
-        console.log(`[habitaclia] card parse error: ${(e as Error).message}`);
+        seen.add(id);
+        results.push({
+          external_id: id,
+          portal: "habitaclia",
+          title,
+          price: firstMoney(normalize((node.querySelector(".list-item-price") as HTMLElement | null)?.textContent) || text),
+          url: absolute(href),
+          surface_m2: firstNumber(text, /(\d+(?:[,.]\d+)?)\s*m(?:²|2)\b/i),
+          rooms: firstNumber(text, /(\d+)\s*(?:habitaciones?|habs?)/i),
+          bathrooms: firstNumber(text, /(\d+)\s*baños?/i),
+          images,
+          raw: { textPreview: text.slice(0, 500) },
+        });
       }
-    }
 
-    console.log(`[habitaclia] extractedCards=${nodes.length} withId=${listings.length}`);
+      return results;
+    }, expectedHrefPart)) as Listing[];
+
+    console.log(`[habitaclia] selector="${selector}" matchedNodes=${rawNodes}`);
+    console.log(`[habitaclia] extractedCards=${rawNodes} withId=${listings.length}`);
     if (listings.length === 0) {
       console.log(
         `[habitaclia] no listings extracted (selector may be stale or page is a captcha/empty shell)`
@@ -113,5 +156,18 @@ export async function scrapeHabitaclia(params: SearchParams): Promise<Listing[]>
   } finally {
     await context?.close().catch(() => {});
     await browser?.close().catch(() => {});
+  }
+}
+
+export async function scrapeHabitaclia(params: SearchParams): Promise<Listing[]> {
+  const proxy = getProxyConfigFor("habitaclia");
+  try {
+    return await scrapeHabitacliaWithProxy(params, proxy);
+  } catch (err) {
+    if (proxy && isLikelyProxyFailure(err)) {
+      console.warn("[habitaclia] proxy falló, reintentando sin proxy");
+      return await scrapeHabitacliaWithProxy(params, null);
+    }
+    throw err;
   }
 }

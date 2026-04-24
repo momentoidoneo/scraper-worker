@@ -18,8 +18,12 @@ export async function ingestResults(payload: IngestPayload) {
       headers: { "content-type": "application/json", "x-worker-token": WORKER_TOKEN },
       body: JSON.stringify(payload),
     });
-    if (!res.ok) console.warn(`[ingest] non-2xx ${res.status} for job=${payload.jobId}`);
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      throw new Error(`ingest_non_2xx:${res.status}${body ? `:${body.slice(0, 500)}` : ""}`);
+    }
   } catch (e) {
     console.error(`[ingest] failed for job=${payload.jobId}`, e);
+    throw e;
   }
 }

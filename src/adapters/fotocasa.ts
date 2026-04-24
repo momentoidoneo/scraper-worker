@@ -1,13 +1,23 @@
 import { chromium, type Browser, type BrowserContext } from "playwright";
 import { buildFotocasaUrl, type SearchParams } from "../lib/url-builder.js";
-import { getProxyConfigFor } from "../lib/proxy.js";
+import { getProxyConfigFor, isLikelyProxyFailure } from "../lib/proxy.js";
 
 export type Listing = {
-  id: string;
+  external_id: string;
   portal: "fotocasa";
   title: string;
   price: number | null;
   url: string;
+  surface_m2?: number | null;
+  rooms?: number | null;
+  bathrooms?: number | null;
+  property_type?: string | null;
+  operation?: string | null;
+  address?: string | null;
+  zone?: string | null;
+  city?: string | null;
+  images?: string[];
+  description?: string | null;
   raw?: any;
 };
 
@@ -15,9 +25,11 @@ const UA =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 " +
   "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
-export async function scrapeFotocasa(params: SearchParams): Promise<Listing[]> {
+async function scrapeFotocasaWithProxy(
+  params: SearchParams,
+  proxy: ReturnType<typeof getProxyConfigFor>,
+): Promise<Listing[]> {
   const url = buildFotocasaUrl(params);
-  const proxy = getProxyConfigFor("fotocasa");
 
   console.log(
     `[fotocasa] goto url=${url} params=${JSON.stringify(params)} proxy=${
@@ -46,6 +58,7 @@ export async function scrapeFotocasa(params: SearchParams): Promise<Listing[]> {
     const page = await context.newPage();
 
     const resp = await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+    await page.waitForTimeout(1500);
     const status = resp?.status() ?? 0;
     const finalUrl = page.url();
     const html = await page.content();
@@ -63,45 +76,78 @@ export async function scrapeFotocasa(params: SearchParams): Promise<Listing[]> {
       console.log(`[fotocasa] blockHints=${blockHints.join("|")}`);
     }
 
-    const selector =
-      "[data-test='listing-item'], article.re-Searchresult-item, [data-cy='listing-item'], div.re-CardPackMinimal";
-    const nodes = await page.$$(selector);
-    console.log(`[fotocasa] selector="${selector}" matchedNodes=${nodes.length}`);
+    const selector = "article";
+    const rawNodes = await page.$$eval(selector, (nodes) => nodes.length);
+    const listings = (await page.$$eval(selector, (nodes) => {
+      const detailPattern = /\/es\/(?:comprar|alquiler)\/vivienda\/[^?#]+\/(\d+)\/d(?:[?#].*)?$/;
+      const normalize = (value: string | null | undefined) => (value || "").replace(/\s+/g, " ").trim();
+      const absolute = (href: string) => {
+        if (href.startsWith("http")) return href;
+        if (href.startsWith("//")) return `https:${href}`;
+        return `https://www.fotocasa.es${href.startsWith("/") ? href : `/${href}`}`;
+      };
+      const firstMoney = (text: string) => {
+        const match = text.match(/(\d{1,3}(?:\.\d{3})+|\d+)\s*€/);
+        return match ? Number(match[1].replace(/\./g, "")) : null;
+      };
+      const firstNumber = (text: string, pattern: RegExp) => {
+        const match = text.match(pattern);
+        if (!match) return null;
+        const parsed = Number(match[1].replace(",", "."));
+        return Number.isFinite(parsed) ? parsed : null;
+      };
+      const seen = new Set<string>();
+      const results: Array<Record<string, unknown>> = [];
 
-    const listings: Listing[] = [];
-    for (const node of nodes) {
-      try {
-        const id =
-          (await node.getAttribute("data-test-id")) ||
-          (await node.getAttribute("data-id")) ||
-          (await node.getAttribute("id")) ||
-          "";
+      for (const node of nodes) {
+        const anchors = Array.from(node.querySelectorAll("a[href]")) as HTMLAnchorElement[];
+        const detailLinks = anchors.filter((link) => detailPattern.test(link.getAttribute("href") || ""));
+        const cleanLinks = detailLinks.filter((link) => !(link.getAttribute("href") || "").includes("multimedia="));
+        const looksLikeAgency = (value: string) => /líder de zona|inmobiliaria|real estate|agency|properties|partner inmobiliario|calidad fotocasa/i.test(value);
+        const titleLink =
+          cleanLinks.find((link) => {
+            const text = normalize(link.textContent);
+            return !looksLikeAgency(text) && /piso|casa|ático|atico|vivienda|apartamento|chalet|dúplex|duplex|local|loft|estudio/i.test(text);
+          }) ||
+          cleanLinks.find((link) => {
+            const text = normalize(link.textContent);
+            return !looksLikeAgency(text) && text.length > 20;
+          }) ||
+          cleanLinks[0] ||
+          detailLinks[0];
+        if (!titleLink) continue;
 
-        const linkEl = await node.$("a[href*='/comprar/'], a[href*='/alquiler/'], a.re-CardPackMinimal-info");
-        const href = (await linkEl?.getAttribute("href")) || "";
-        const title =
-          ((await (await node.$("h2, h3, [class*='title']"))?.innerText()) || "").trim();
+        const href = titleLink.getAttribute("href") || "";
+        const id = href.match(detailPattern)?.[1] || node.getAttribute("data-id") || node.getAttribute("id") || "";
+        if (!id || seen.has(id)) continue;
 
-        const priceEl = await node.$("[class*='price'], [data-test='price']");
-        const priceText = (await priceEl?.innerText())?.replace(/[^\d]/g, "") || "";
-        const price = priceText ? Number(priceText) : null;
+        const text = normalize(node.textContent);
+        const title = normalize(titleLink.textContent) || normalize((node.querySelector("img[alt]") as HTMLImageElement | null)?.alt) || "(sin título)";
+        const images = Array.from(node.querySelectorAll("img"))
+          .map((img) => img.getAttribute("src") || img.getAttribute("data-src") || "")
+          .filter((src) => src && /fotocasa|static/i.test(src))
+          .map((src) => (src.startsWith("//") ? `https:${src}` : src));
 
-        if (href || title) {
-          const finalId = id || href.split("/").filter(Boolean).pop() || crypto.randomUUID();
-          listings.push({
-            id: finalId,
-            portal: "fotocasa",
-            title: title || "(sin título)",
-            price,
-            url: href.startsWith("http") ? href : `https://www.fotocasa.es${href}`,
-          });
-        }
-      } catch (e) {
-        console.log(`[fotocasa] card parse error: ${(e as Error).message}`);
+        seen.add(id);
+        results.push({
+          external_id: id,
+          portal: "fotocasa",
+          title,
+          price: firstMoney(text),
+          url: absolute(href),
+          surface_m2: firstNumber(text, /(\d+(?:[,.]\d+)?)\s*m(?:²|2)\b/i),
+          rooms: firstNumber(text, /(\d+)\s*(?:habs?|habitaciones?)/i),
+          bathrooms: firstNumber(text, /(\d+)\s*baños?/i),
+          images,
+          raw: { textPreview: text.slice(0, 500) },
+        });
       }
-    }
 
-    console.log(`[fotocasa] extractedCards=${nodes.length} withId=${listings.length}`);
+      return results;
+    })) as Listing[];
+
+    console.log(`[fotocasa] selector="${selector}" matchedNodes=${rawNodes}`);
+    console.log(`[fotocasa] extractedCards=${rawNodes} withId=${listings.length}`);
     if (listings.length === 0) {
       console.log(
         `[fotocasa] no listings extracted (selector may be stale or page is a captcha/empty shell)`
@@ -115,5 +161,18 @@ export async function scrapeFotocasa(params: SearchParams): Promise<Listing[]> {
   } finally {
     await context?.close().catch(() => {});
     await browser?.close().catch(() => {});
+  }
+}
+
+export async function scrapeFotocasa(params: SearchParams): Promise<Listing[]> {
+  const proxy = getProxyConfigFor("fotocasa");
+  try {
+    return await scrapeFotocasaWithProxy(params, proxy);
+  } catch (err) {
+    if (proxy && isLikelyProxyFailure(err)) {
+      console.warn("[fotocasa] proxy falló, reintentando sin proxy");
+      return await scrapeFotocasaWithProxy(params, null);
+    }
+    throw err;
   }
 }

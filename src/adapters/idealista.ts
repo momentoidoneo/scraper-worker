@@ -1,143 +1,189 @@
-import { chromium, type Browser, type BrowserContext } from "playwright";
 import { buildIdealistaUrl, type SearchParams } from "../lib/url-builder.js";
-import { getProxyConfigFor } from "../lib/proxy.js";
 
 export type Listing = {
-  id: string;
+  external_id: string;
   portal: "idealista";
   title: string;
   price: number | null;
   url: string;
+  surface_m2?: number | null;
+  rooms?: number | null;
+  bathrooms?: number | null;
+  property_type?: string | null;
+  operation?: string | null;
+  address?: string | null;
+  zone?: string | null;
+  city?: string | null;
+  images?: string[];
+  description?: string | null;
   raw?: any;
 };
 
-const UA =
-  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 " +
-  "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+type ApifyItem = Record<string, any>;
 
-function isProxyAuthUnsupported(error: unknown): boolean {
-  const message = error instanceof Error ? error.message : String(error);
-  return message.includes("ERR_PROXY_AUTH_UNSUPPORTED");
+const ACTOR_ID = process.env.APIFY_IDEALISTA_ACTOR_ID?.trim() || "dz_omar~idealista-scraper-api";
+const STANDBY_URL = process.env.APIFY_IDEALISTA_STANDBY_URL?.trim() || "";
+const REQUEST_TIMEOUT = Number.parseInt(process.env.APIFY_IDEALISTA_TIMEOUT_MS ?? "240000", 10);
+
+function requiredToken(): string {
+  const token = process.env.APIFY_TOKEN?.trim() || process.env.APIFY_API_TOKEN?.trim();
+  if (!token) {
+    throw new Error("idealista_apify_not_configured: set APIFY_TOKEN in worker .env.runtime");
+  }
+  return token;
 }
 
-async function scrapeWithOptionalProxy(
-  url: string,
-  proxy: ReturnType<typeof getProxyConfigFor>
-): Promise<Listing[]> {
-  let browser: Browser | null = null;
-  let context: BrowserContext | null = null;
+function desiredResults(): number {
+  const parsed = Number.parseInt(process.env.APIFY_IDEALISTA_DESIRED_RESULTS ?? "20", 10);
+  if (!Number.isFinite(parsed)) return 20;
+  return Math.max(10, Math.min(parsed, 100));
+}
 
-  try {
-    browser = await chromium.launch({
-      headless: true,
-      proxy: proxy
-        ? {
-            server: proxy.server,
-            username: proxy.username,
-            password: proxy.password,
-          }
-        : undefined,
-    });
-
-    context = await browser.newContext({
-      userAgent: UA,
-      locale: "es-ES",
-      viewport: { width: 1366, height: 900 },
-    });
-
-    const page = await context.newPage();
-
-    const resp = await page.goto(url, {
-      waitUntil: "domcontentloaded",
-      timeout: 30000,
-    });
-
-    const status = resp?.status() ?? 0;
-    const finalUrl = page.url();
-    const html = await page.content();
-    const bytes = Buffer.byteLength(html, "utf8");
-
-    console.log(`[idealista] status=${status} finalUrl=${finalUrl} htmlBytes=${bytes}`);
-    console.log(`[idealista] htmlPreview=${html.slice(0, 500).replace(/\n/g, " ")}`);
-
-    const lower = html.toLowerCase();
-    const blockHints: string[] = [];
-    if (lower.includes("captcha")) blockHints.push("captcha");
-    if (lower.includes("datadome")) blockHints.push("datadome");
-    if (lower.includes("are you a human")) blockHints.push("are-you-human");
-    if (status === 403) blockHints.push("http-403");
-    if (blockHints.length) {
-      console.log(`[idealista] blockHints=${blockHints.join("|")}`);
+function numberValue(...values: unknown[]): number | null {
+  for (const value of values) {
+    if (typeof value === "number" && Number.isFinite(value)) return value;
+    if (typeof value === "string" && value.trim()) {
+      const parsed = Number(value.replace(/[^\d.,-]/g, "").replace(/\./g, "").replace(",", "."));
+      if (Number.isFinite(parsed)) return parsed;
     }
+  }
+  return null;
+}
 
-    const selector = "article.item";
-    const nodes = await page.$$(selector);
-    console.log(`[idealista] selector="${selector}" matchedNodes=${nodes.length}`);
+function stringValue(...values: unknown[]): string | null {
+  for (const value of values) {
+    if (typeof value === "string" && value.trim()) return value.trim();
+    if (typeof value === "number" && Number.isFinite(value)) return String(value);
+  }
+  return null;
+}
 
-    const listings: Listing[] = [];
-    for (const node of nodes) {
+function absoluteIdealistaUrl(value: unknown): string | null {
+  const url = stringValue(value);
+  if (!url) return null;
+  if (url.startsWith("http")) return url;
+  return `https://www.idealista.com${url.startsWith("/") ? url : `/${url}`}`;
+}
+
+function parseNdjson(text: string): ApifyItem[] {
+  return text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+}
+
+async function fetchApifyItems(payload: Record<string, unknown>, token: string): Promise<ApifyItem[]> {
+  const ctrl = new AbortController();
+  const timeout = setTimeout(() => ctrl.abort(), REQUEST_TIMEOUT);
+  try {
+    if (STANDBY_URL) {
+      const res = await fetch(STANDBY_URL, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify(payload),
+        signal: ctrl.signal,
+      });
+      const text = await res.text();
+      if (!res.ok) throw new Error(`apify_standby_non_2xx:${res.status}:${text.slice(0, 300)}`);
       try {
-        const id =
-          (await node.getAttribute("data-element-id")) ||
-          (await node.getAttribute("id")) ||
-          "";
-
-        const titleEl = await node.$("a.item-link");
-        const title = (await titleEl?.innerText())?.trim() || "";
-        const href = (await titleEl?.getAttribute("href")) || "";
-
-        const priceEl = await node.$(".item-price, .price-row .item-price");
-        const priceText = (await priceEl?.innerText())?.replace(/[^\d]/g, "") || "";
-        const price = priceText ? Number(priceText) : null;
-
-        if (id && title) {
-          listings.push({
-            id,
-            portal: "idealista",
-            title,
-            price,
-            url: href.startsWith("http") ? href : `https://www.idealista.com${href}`,
-          });
-        }
-      } catch (e) {
-        console.log(`[idealista] card parse error: ${(e as Error).message}`);
+        const parsed = JSON.parse(text);
+        return Array.isArray(parsed) ? parsed : Array.isArray(parsed?.items) ? parsed.items : [parsed];
+      } catch {
+        return parseNdjson(text);
       }
     }
 
-    console.log(`[idealista] extractedCards=${nodes.length} withId=${listings.length}`);
-    if (listings.length === 0) {
-      console.log(
-        `[idealista] no listings extracted (selector may be stale or page is a captcha/empty shell)`
-      );
-    }
-    console.log(`[idealista] finished collected=${listings.length}`);
-
-    return listings;
+    const endpoint = `https://api.apify.com/v2/acts/${encodeURIComponent(ACTOR_ID)}/run-sync-get-dataset-items?token=${encodeURIComponent(token)}`;
+    const res = await fetch(endpoint, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
+      signal: ctrl.signal,
+    });
+    const text = await res.text();
+    if (!res.ok) throw new Error(`apify_non_2xx:${res.status}:${text.slice(0, 300)}`);
+    const parsed = JSON.parse(text);
+    return Array.isArray(parsed) ? parsed : Array.isArray(parsed?.items) ? parsed.items : [parsed];
   } finally {
-    await context?.close().catch(() => {});
-    await browser?.close().catch(() => {});
+    clearTimeout(timeout);
   }
 }
 
-export async function scrapeIdealista(params: SearchParams): Promise<Listing[]> {
-  const url = buildIdealistaUrl(params);
-  const proxy = getProxyConfigFor("idealista");
+function mapOperation(value: unknown, fallback: string): string {
+  const op = stringValue(value)?.toLowerCase();
+  if (op === "rent" || op === "alquiler") return "alquiler";
+  if (op === "sale" || op === "venta" || op === "compra") return "compra";
+  return fallback;
+}
 
-  console.log(
-    `[idealista] goto url=${url} params=${JSON.stringify(params)} proxy=${
-      proxy ? proxy.server : "none"
-    }`
+function mapListing(item: ApifyItem, params: SearchParams): Listing | null {
+  if (item.error || item.errors) return null;
+
+  const id = stringValue(item.propertyCode, item.adid, item.propertyId, item.id, item.identifier, item.externalReference);
+  const url = absoluteIdealistaUrl(item.detailWebLink ?? item.url ?? item.webLink);
+  if (!id && !url) return null;
+
+  const characteristics = item.moreCharacteristics ?? item.characteristics ?? {};
+  const location = item.ubication ?? item.location ?? {};
+  const priceInfo = item.priceInfo ?? {};
+  const multimedia = item.multimedia ?? {};
+  const rawImages = Array.isArray(multimedia.images) ? multimedia.images : Array.isArray(item.images) ? item.images : [];
+  const images = [item.thumbnail, ...rawImages]
+    .map((image: any) => stringValue(image?.url, image?.src, image))
+    .filter((value: string | null): value is string => Boolean(value));
+
+  const address = stringValue(
+    location.title,
+    location.address,
+    item.address,
+    item.suggestedTexts?.subtitle,
   );
+  const title = stringValue(
+    item.suggestedTexts?.title,
+    item.title,
+    item.displayTitle,
+    address,
+    item.description,
+  ) ?? "(sin título)";
 
-  try {
-    return await scrapeWithOptionalProxy(url, proxy);
-  } catch (err) {
-    if (proxy && isProxyAuthUnsupported(err)) {
-      console.warn("[idealista] proxy auth no soportado por Chromium, reintentando sin proxy");
-      return await scrapeWithOptionalProxy(url, null);
-    }
+  return {
+    external_id: id ?? url ?? crypto.randomUUID(),
+    portal: "idealista",
+    title,
+    price: numberValue(item.price, priceInfo.amount, item.priceAmount),
+    url: url ?? `https://www.idealista.com/inmueble/${id}/`,
+    surface_m2: numberValue(characteristics.constructedArea, characteristics.usableArea, item.size, item.surface),
+    rooms: numberValue(characteristics.roomNumber, item.rooms, item.bedrooms),
+    bathrooms: numberValue(characteristics.bathNumber, item.bathrooms),
+    property_type: stringValue(item.extendedPropertyType, item.propertyType) ?? params.property_type,
+    operation: mapOperation(item.operation, params.operation),
+    address,
+    zone: stringValue(location.district, location.neighborhood, item.district, params.zones[0]) ?? null,
+    city: stringValue(location.municipality, location.administrativeAreaLevel2, item.city) ?? params.city,
+    images,
+    description: stringValue(item.description, item.comment, item.comments),
+    raw: item,
+  };
+}
 
-    console.error("[idealista] FATAL", err);
-    throw err;
-  }
+export async function scrapeIdealista(params: SearchParams): Promise<Listing[]> {
+  const token = requiredToken();
+  const url = buildIdealistaUrl(params);
+  const payload = {
+    Property_urls: [{ url }],
+    desiredResults: desiredResults(),
+  };
+
+  console.log(`[idealista] apify actor=${ACTOR_ID} url=${url} desiredResults=${payload.desiredResults}`);
+  const items = await fetchApifyItems(payload, token);
+  const listings = items
+    .map((item) => mapListing(item, params))
+    .filter((listing): listing is Listing => Boolean(listing));
+
+  console.log(`[idealista] apifyItems=${items.length} listings=${listings.length}`);
+  return listings;
 }
