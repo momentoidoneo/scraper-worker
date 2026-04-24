@@ -10,12 +10,14 @@ export type Listing = {
   rooms?: number | null;
   bathrooms?: number | null;
   property_type?: string | null;
+  listing_type?: "particular" | "agencia" | null;
   operation?: string | null;
   address?: string | null;
   zone?: string | null;
   city?: string | null;
   images?: string[];
   description?: string | null;
+  published_at?: string | null;
   raw?: any;
 };
 
@@ -56,6 +58,19 @@ function stringValue(...values: unknown[]): string | null {
     if (typeof value === "number" && Number.isFinite(value)) return String(value);
   }
   return null;
+}
+
+function dateValue(...values: unknown[]): string | null {
+  for (const value of values) {
+    if (typeof value !== "string" && typeof value !== "number") continue;
+    const timestamp = Date.parse(String(value));
+    if (Number.isFinite(timestamp)) return new Date(timestamp).toISOString();
+  }
+  return null;
+}
+
+function normalize(value: unknown): string {
+  return stringValue(value)?.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().trim() ?? "";
 }
 
 function absoluteIdealistaUrl(value: unknown): string | null {
@@ -120,6 +135,35 @@ function mapOperation(value: unknown, fallback: string): string {
   return fallback;
 }
 
+function mapPropertyType(...values: unknown[]): string | null {
+  const text = values.map(normalize).join(" ");
+  if (!text) return null;
+  const patterns: Array<[string, RegExp]> = [
+    ["duplex", /\bduplex(?:es)?\b/],
+    ["atico", /\b(?:atico|aticos|penthouse|penthouses)\b/],
+    ["estudio", /\b(?:estudio|estudios|studio|studios|loft|lofts)\b/],
+    ["piso", /\b(?:piso|pisos|flat|flats|apartment|apartments|apartamento|apartamentos)\b/],
+    ["local", /\b(?:local|locales|premises|commercial)\b/],
+    ["oficina", /\b(?:oficina|oficinas|office|offices)\b/],
+    ["garaje", /\b(?:garaje|garajes|garage|garages|parking)\b/],
+    ["casa", /\b(?:casa|casas|house|houses|chalet|chalets|villa|villas|countryhouse|country house|terracedhouse|terraced house)\b/],
+  ];
+  return patterns.find(([, pattern]) => pattern.test(text))?.[0] ?? null;
+}
+
+function mapListingType(...values: unknown[]): "particular" | "agencia" | null {
+  const text = values.map(normalize).join(" ");
+  if (!text) return null;
+  if (/\b(particular|private|privado|propietario|owner)\b/.test(text)) return "particular";
+  if (/\b(agencia|agency|inmobiliaria|professional|profesional|promotor|promotora|real estate|properties)\b/.test(text)) return "agencia";
+  return null;
+}
+
+function publishedAt(item: ApifyItem): string | null {
+  return dateValue(item.publishedDate, item.publicationDate, item.date, item.createdAt, item.updatedAt, item.modificationDate, item.updateDate) ??
+    (item.newProperty === true ? new Date().toISOString() : null);
+}
+
 function mapListing(item: ApifyItem, params: SearchParams): Listing | null {
   if (item.error || item.errors) return null;
 
@@ -149,6 +193,7 @@ function mapListing(item: ApifyItem, params: SearchParams): Listing | null {
     address,
     item.description,
   ) ?? "(sin título)";
+  const contactInfo = item.contactInfo ?? {};
 
   return {
     external_id: id ?? url ?? crypto.randomUUID(),
@@ -159,13 +204,15 @@ function mapListing(item: ApifyItem, params: SearchParams): Listing | null {
     surface_m2: numberValue(characteristics.constructedArea, characteristics.usableArea, item.size, item.surface),
     rooms: numberValue(characteristics.roomNumber, item.rooms, item.bedrooms),
     bathrooms: numberValue(characteristics.bathNumber, item.bathrooms),
-    property_type: stringValue(item.extendedPropertyType, item.propertyType) ?? params.property_type,
+    property_type: mapPropertyType(item.extendedPropertyType, item.propertyType, title, url) ?? params.property_type,
+    listing_type: mapListingType(item.listingType, item.advertiserType, item.publisherType, item.userType, contactInfo.userType, contactInfo.commercialName, contactInfo.name),
     operation: mapOperation(item.operation, params.operation),
     address,
     zone: stringValue(location.district, location.neighborhood, item.district, params.zones[0]) ?? null,
     city: stringValue(location.municipality, location.administrativeAreaLevel2, item.city) ?? params.city,
     images,
     description: stringValue(item.description, item.comment, item.comments),
+    published_at: publishedAt(item),
     raw: item,
   };
 }

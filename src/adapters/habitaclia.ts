@@ -12,12 +12,14 @@ export type Listing = {
   rooms?: number | null;
   bathrooms?: number | null;
   property_type?: string | null;
+  listing_type?: "particular" | "agencia" | null;
   operation?: string | null;
   address?: string | null;
   zone?: string | null;
   city?: string | null;
   images?: string[];
   description?: string | null;
+  published_at?: string | null;
   raw?: any;
 };
 
@@ -91,6 +93,38 @@ async function scrapeHabitacliaWithProxy(
         const parsed = Number(match[1].replace(",", "."));
         return Number.isFinite(parsed) ? parsed : null;
       };
+      const normalizeText = (value: string | null | undefined) => normalize(value).normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+      const detectPropertyType = (value: string) => {
+        const text = normalizeText(value);
+        const patterns: Array<[string, RegExp]> = [
+          ["duplex", /\bduplex(?:es)?\b/],
+          ["atico", /\b(?:atico|aticos|penthouse|penthouses)\b/],
+          ["estudio", /\b(?:estudio|estudios|studio|studios|loft|lofts)\b/],
+          ["piso", /\b(?:piso|pisos|flat|flats|apartment|apartments|apartamento|apartamentos|vivienda|viviendas)\b/],
+          ["local", /\b(?:local|locales|premises|commercial)\b/],
+          ["oficina", /\b(?:oficina|oficinas|office|offices)\b/],
+          ["garaje", /\b(?:garaje|garajes|garage|garages|parking)\b/],
+          ["casa", /\b(?:casa|casas|house|houses|chalet|chalets|villa|villas)\b/],
+        ];
+        return patterns.find(([, pattern]) => pattern.test(text))?.[0] ?? null;
+      };
+      const detectListingType = (value: string) => {
+        const text = normalizeText(value);
+        if (/\b(particular|propietario|private|privado)\b/.test(text)) return "particular";
+        if (/\b(inmobiliaria|agencia|agency|professional|profesional|promotor|promotora|real estate|properties|habitaclia)\b/.test(text)) return "agencia";
+        return null;
+      };
+      const publishedAt = (value: string) => {
+        const text = normalizeText(value);
+        const now = Date.now();
+        if (/\b(hoy|nuevo)\b/.test(text)) return new Date(now).toISOString();
+        if (/\bayer\b/.test(text)) return new Date(now - 24 * 60 * 60 * 1000).toISOString();
+        let match = text.match(/hace\s*(\d+)\s*(?:hora|horas|h)\b/);
+        if (match) return new Date(now - Number(match[1]) * 60 * 60 * 1000).toISOString();
+        match = text.match(/hace\s*(\d+)\s*(?:dia|dias|d)\b/);
+        if (match) return new Date(now - Number(match[1]) * 24 * 60 * 60 * 1000).toISOString();
+        return null;
+      };
       const absolute = (href: string) => {
         if (href.startsWith("http")) return href;
         if (href.startsWith("//")) return `https:${href}`;
@@ -117,6 +151,7 @@ async function scrapeHabitacliaWithProxy(
         if (!id || seen.has(id)) continue;
 
         const text = normalize(node.textContent);
+        const advertiserHint = detailLinks.some((link) => (link.getAttribute("href") || "").includes("/inmobiliaria-")) ? " inmobiliaria" : "";
         const title = normalize(titleLink?.textContent) || normalize((node.querySelector("img[alt]") as HTMLImageElement | null)?.alt) || "(sin título)";
         const images = Array.from(node.querySelectorAll("img"))
           .map((img) => img.getAttribute("src") || img.getAttribute("data-src") || "")
@@ -133,6 +168,9 @@ async function scrapeHabitacliaWithProxy(
           surface_m2: firstNumber(text, /(\d+(?:[,.]\d+)?)\s*m(?:²|2)\b/i),
           rooms: firstNumber(text, /(\d+)\s*(?:habitaciones?|habs?)/i),
           bathrooms: firstNumber(text, /(\d+)\s*baños?/i),
+          property_type: detectPropertyType(title + " " + href + " " + text),
+          listing_type: detectListingType(title + " " + href + " " + text + advertiserHint),
+          published_at: publishedAt(text),
           images,
           raw: { textPreview: text.slice(0, 500) },
         });

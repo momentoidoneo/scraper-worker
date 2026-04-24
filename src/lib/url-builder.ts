@@ -14,6 +14,7 @@ export function slugifyCity(city: string): string {
 export type SearchParams = {
   operation: "compra" | "alquiler" | "alquiler_temporal" | string;
   property_type: "piso" | "casa" | "local" | string;
+  property_types: string[];
   city: string;
   zones: string[];
   price_min?: number;
@@ -57,11 +58,31 @@ function stringArray(...values: unknown[]): string[] {
   return [];
 }
 
+function canonicalPropertyType(value: string | undefined): string {
+  const text = (value ?? "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "");
+
+  if (["casa", "casas", "chalet", "chalets", "house", "villa"].some((v) => text.includes(v))) return "casa";
+  if (["local", "locales", "premises"].some((v) => text.includes(v))) return "local";
+  if (["oficina", "oficinas", "office"].some((v) => text.includes(v))) return "oficina";
+  if (["garaje", "garajes", "garage", "parking"].some((v) => text.includes(v))) return "garaje";
+  if (["duplex"].some((v) => text.includes(v))) return "duplex";
+  if (["atico", "penthouse"].some((v) => text.includes(v))) return "atico";
+  if (["estudio", "studio", "loft"].some((v) => text.includes(v))) return "estudio";
+  if (["piso", "pisos", "flat", "apartment", "apartamento"].some((v) => text.includes(v))) return "piso";
+  return value ?? "piso";
+}
+
 export function normalizeSearchParams(raw: RawSearchParams): SearchParams {
   const propertyTypes = stringArray(raw.propertyTypes, raw.property_types, raw.property_type);
+  const normalizedPropertyTypes = propertyTypes.map(canonicalPropertyType).filter(Boolean);
   return {
     operation: stringValue(raw.operation, "compra"),
-    property_type: propertyTypes[0] ?? "piso",
+    property_type: normalizedPropertyTypes[0] ?? "piso",
+    property_types: normalizedPropertyTypes.length ? normalizedPropertyTypes : ["piso"],
     city: stringValue(raw.city, "Madrid"),
     zones: stringArray(raw.zones, raw.zone),
     price_min: numberValue(raw.priceMin, raw.price_min),
@@ -104,7 +125,8 @@ export function buildIdealistaUrl(input: RawSearchParams): string {
 export function buildFotocasaUrl(input: RawSearchParams): string {
   const p = normalizeSearchParams(input);
   const op = p.operation === "alquiler" || p.operation === "alquiler_temporal" ? "alquiler" : "comprar";
-  const type = p.property_type === "casa" ? "casas" : "viviendas";
+  const type = p.property_type === "casa" ? "casas" : p.property_type === "local" ? "locales" :
+    p.property_type === "oficina" ? "oficinas" : p.property_type === "garaje" ? "garajes" : "viviendas";
   const slug = slugifyCity(p.city);
   const qs = new URLSearchParams();
   if (p.price_min) qs.set("minPrice", String(p.price_min));
