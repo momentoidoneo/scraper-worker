@@ -282,7 +282,8 @@ export async function scrapeIdealista(params: SearchParams): Promise<Listing[]> 
   const token = requiredToken();
   const targetResults = desiredResults();
   const searches = searchUrls(params, targetResults);
-  const listingMap = new Map<string, Listing>();
+  const seenListings = new Set<string>();
+  const searchListings: Listing[][] = [];
   let itemCount = 0;
 
   console.log(`[idealista] apify actor=${ACTOR_ID} searches=${searches.length} desiredTotal=${targetResults}`);
@@ -295,15 +296,31 @@ export async function scrapeIdealista(params: SearchParams): Promise<Listing[]> 
     console.log(`[idealista] apify url=${search.url} desiredResults=${payload.desiredResults}`);
     const items = await fetchApifyItems(payload, token);
     itemCount += items.length;
+    const listingsForSearch: Listing[] = [];
     for (const item of items) {
       const listing = mapListing(item, params);
       if (!listing) continue;
       const key = listing.external_id || listing.url;
-      if (!listingMap.has(key)) listingMap.set(key, listing);
+      if (seenListings.has(key)) continue;
+      seenListings.add(key);
+      listingsForSearch.push(listing);
     }
+    searchListings.push(listingsForSearch);
   }
 
-  const listings = Array.from(listingMap.values()).slice(0, targetResults);
-  console.log(`[idealista] apifyItems=${itemCount} uniqueListings=${listingMap.size} listings=${listings.length}`);
+  const listings: Listing[] = [];
+  for (let index = 0; listings.length < targetResults; index += 1) {
+    let added = false;
+    for (const group of searchListings) {
+      const listing = group[index];
+      if (!listing) continue;
+      listings.push(listing);
+      added = true;
+      if (listings.length >= targetResults) break;
+    }
+    if (!added) break;
+  }
+
+  console.log(`[idealista] apifyItems=${itemCount} uniqueListings=${seenListings.size} listings=${listings.length}`);
   return listings;
 }
