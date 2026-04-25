@@ -1,4 +1,4 @@
-import { chromium, type Browser, type BrowserContext, type Page } from "playwright";
+import { chromium, type Browser, type Page } from "playwright";
 import { buildHabitacliaUrl, type SearchParams } from "../lib/url-builder.js";
 import { getProxyConfigFor, isLikelyProxyFailure } from "../lib/proxy.js";
 
@@ -35,6 +35,12 @@ function envInt(name: string, fallback: number, min: number, max: number): numbe
 
 const MAX_PAGES = envInt("HABITACLIA_MAX_PAGES", 5, 1, 25);
 const MAX_RESULTS = envInt("HABITACLIA_MAX_RESULTS", 90, 10, 300);
+const PAGE_DELAY_MS = envInt("HABITACLIA_PAGE_DELAY_MS", 3500, 0, 15000);
+const PAGE_RETRY_DELAY_MS = envInt("HABITACLIA_PAGE_RETRY_DELAY_MS", 10000, 0, 30000);
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 function normalizeText(value: unknown): string {
   return String(value ?? "")
@@ -174,7 +180,6 @@ async function scrapeHabitacliaWithProxy(
   );
 
   let browser: Browser | null = null;
-  let context: BrowserContext | null = null;
   try {
     browser = await chromium.launch({
       headless: true,
@@ -186,42 +191,72 @@ async function scrapeHabitacliaWithProxy(
           }
         : undefined,
     });
-    context = await browser.newContext({
-      userAgent: UA,
-      locale: "es-ES",
-      viewport: { width: 1366, height: 900 },
-    });
-    const page = await context.newPage();
     const selector = "article.js-list-item[data-id], article.list-item-container[data-id]";
     const expectedHrefPart = params.operation === "alquiler" || params.operation === "alquiler_temporal" ? "alquiler-" : "comprar-";
     const maxPages = maxPagesFor(params);
     const maxResults = maxResultsFor(params);
     let rawNodes = 0;
     const listingMap = new Map<string, Listing>();
-    for (let pageIndex = 0; pageIndex < maxPages && listingMap.size < maxResults; pageIndex += 1) {
-      const currentUrl = pageUrl(url, pageIndex);
-      const resp = await page.goto(currentUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
-      await page.waitForTimeout(1000);
-      const status = resp?.status() ?? 0;
-      const finalUrl = page.url();
-      const html = await page.content();
-      const bytes = Buffer.byteLength(html, "utf8");
 
-      console.log(`[habitaclia] status=${status} page=${pageIndex + 1}/${maxPages} finalUrl=${finalUrl} htmlBytes=${bytes}`);
-      if (pageIndex === 0) {
-        console.log(`[habitaclia] htmlPreview=${html.slice(0, 500).replace(/\n/g, " ")}`);
+    const scrapePage = async (
+      currentUrl: string,
+      pageIndex: number,
+      attempt: number,
+    ): Promise<{ listings: Listing[]; rawNodes: number; blocked: boolean }> => {
+      const context = await browser!.newContext({
+        userAgent: UA,
+        locale: "es-ES",
+        viewport: { width: 1366, height: 900 },
+      });
+      try {
+        const page = await context.newPage();
+        const resp = await page.goto(currentUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
+        await page.waitForTimeout(1000);
+        const status = resp?.status() ?? 0;
+        const finalUrl = page.url();
+        const html = await page.content();
+        const bytes = Buffer.byteLength(html, "utf8");
+
+        console.log(`[habitaclia] status=${status} page=${pageIndex + 1}/${maxPages} attempt=${attempt + 1} finalUrl=${finalUrl} htmlBytes=${bytes}`);
+        if (pageIndex === 0 && attempt === 0) {
+          console.log(`[habitaclia] htmlPreview=${html.slice(0, 500).replace(/\n/g, " ")}`);
+        }
+
+        const lower = html.toLowerCase();
+        const pageNodes = await page.$$eval(selector, (nodes) => nodes.length);
+        const blockHints: string[] = [];
+        if (lower.includes("datadome")) blockHints.push("datadome");
+        if ((status === 403 || status === 429) && pageNodes === 0) blockHints.push(`http-${status}`);
+        if (lower.includes("captcha") && pageNodes === 0) blockHints.push("captcha");
+        if (blockHints.length) console.log(`[habitaclia] blockHints=${blockHints.join("|")}`);
+
+        if (blockHints.length && pageNodes === 0) {
+          console.log(`[habitaclia] page=${pageIndex + 1} blocked before extraction`);
+          return { listings: [], rawNodes: pageNodes, blocked: true };
+        }
+
+        return {
+          listings: await collectVisibleListings(page, expectedHrefPart),
+          rawNodes: pageNodes,
+          blocked: false,
+        };
+      } finally {
+        await context.close().catch(() => {});
+      }
+    };
+
+    for (let pageIndex = 0; pageIndex < maxPages && listingMap.size < maxResults; pageIndex += 1) {
+      if (pageIndex > 0 && PAGE_DELAY_MS > 0) await sleep(PAGE_DELAY_MS);
+      const currentUrl = pageUrl(url, pageIndex);
+      let pageResult = await scrapePage(currentUrl, pageIndex, 0);
+      if (pageResult.blocked && PAGE_RETRY_DELAY_MS > 0) {
+        console.log(`[habitaclia] retry page=${pageIndex + 1} after ${PAGE_RETRY_DELAY_MS}ms`);
+        await sleep(PAGE_RETRY_DELAY_MS);
+        pageResult = await scrapePage(currentUrl, pageIndex, 1);
       }
 
-      const lower = html.toLowerCase();
-      const blockHints: string[] = [];
-      if (lower.includes("captcha")) blockHints.push("captcha");
-      if (lower.includes("datadome")) blockHints.push("datadome");
-      if (status === 403 || status === 429) blockHints.push(`http-${status}`);
-      if (blockHints.length) console.log(`[habitaclia] blockHints=${blockHints.join("|")}`);
-
-      const pageNodes = await page.$$eval(selector, (nodes) => nodes.length);
-      rawNodes += pageNodes;
-      const pageListings = await collectVisibleListings(page, expectedHrefPart);
+      rawNodes += pageResult.rawNodes;
+      const pageListings = pageResult.listings;
       if (!pageListings.length && pageIndex > 0) break;
       for (const listing of pageListings) {
         if (!listingMap.has(listing.external_id)) listingMap.set(listing.external_id, listing);
@@ -242,7 +277,6 @@ async function scrapeHabitacliaWithProxy(
     console.error(`[habitaclia] FATAL`, err);
     throw err;
   } finally {
-    await context?.close().catch(() => {});
     await browser?.close().catch(() => {});
   }
 }
