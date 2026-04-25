@@ -8,6 +8,13 @@ export type ListingTypeClassification = {
   evidence: string[];
 };
 
+export type PrivateLeadAssessment = {
+  status: "confirmed" | "candidate" | "rejected" | "unknown";
+  confidence: number;
+  reason: string;
+  evidence: string[];
+};
+
 export type ClassifiableListing = {
   title?: string | null;
   url?: string | null;
@@ -223,6 +230,100 @@ function hasPositivePrivateSignal(value: string): boolean {
   ].some((pattern) => pattern.test(text));
 }
 
+function agencyEvidence(value: string): string[] {
+  const text = normalizeText(value);
+  const patterns: Array<[RegExp, string]> = [
+    [/\bagencia(?:s)?\b/, "agencia"],
+    [/\binmobiliaria\b/, "inmobiliaria"],
+    [/\bprofessional\b|\bprofesional\b/, "profesional"],
+    [/\bpromotor(?:a)?\b/, "promotor/promotora"],
+    [/\breal\s+estate\b/, "real estate"],
+    [/\bproperties\b/, "properties"],
+    [/\bconsulting\b/, "consulting"],
+    [/\bcalidad\s+fotocasa\b/, "calidad fotocasa"],
+    [/\blider\s+de\s+zona\b/, "líder de zona"],
+    [/\/inmobiliaria-/, "enlace a inmobiliaria"],
+  ];
+  return patterns.filter(([pattern]) => pattern.test(text)).map(([, label]) => label);
+}
+
+function privateSignalEvidence(value: string): string[] {
+  const text = normalizeText(value);
+  const patterns: Array<[RegExp, string]> = [
+    [/\b(?:sin|no)\s+(?:agencias|intermediarios|inmobiliarias)\b/, "rechaza agencias/intermediarios"],
+    [/\babstenerse\s+(?:agencias|intermediarios|inmobiliarias)\b/, "abstenerse agencias"],
+    [/\btrato\s+directo\b/, "trato directo"],
+    [/\bsin\s+comision(?:es)?\s+de\s+agencia\b/, "sin comisión de agencia"],
+    [/\bdirecto\s+(?:con\s+)?(?:propietario|propietaria|dueno|duena)\b/, "directo con propietario"],
+    [/\b(?:soy|somos)\s+(?:el\s+|la\s+|los\s+|las\s+)?(?:propietario|propietaria|dueno|duena)\b/, "dice ser propietario"],
+    [/\b(?:particular|propietario|propietaria|dueno|duena)\s+(?:vende|alquila|ofrece)\b/, "particular/propietario vende o alquila"],
+    [/\b(?:vende|alquila|ofrece)\s+(?:particular|propietario|propietaria|dueno|duena)\b/, "vende/alquila particular"],
+    [/\bde\s+particular\s+a\s+particular\b/, "de particular a particular"],
+    [/\banunciante\s+particular\b/, "anunciante particular"],
+    [/\bprivate\s+(?:advertiser|user|owner)\b/, "private advertiser/user/owner"],
+  ];
+  return patterns.filter(([pattern]) => pattern.test(text)).map(([, label]) => label);
+}
+
+function detailWasFetched(listing: ClassifiableListing): boolean {
+  const raw = asRecord(listing.raw);
+  const detail = asRecord(raw?._detailEnrichment);
+  return detail?.fetched === true;
+}
+
+function privateLeadAssessment(
+  listing: ClassifiableListing,
+  classification: ListingTypeClassification,
+  threshold: number,
+): PrivateLeadAssessment {
+  const context = listingContext(listing);
+  const agency = agencyEvidence(context);
+  const privateSignals = privateSignalEvidence(context);
+
+  if (classification.listing_type === "particular" && classification.confidence >= threshold) {
+    return {
+      status: "confirmed",
+      confidence: classification.confidence,
+      reason: classification.reason,
+      evidence: classification.evidence.length ? classification.evidence : privateSignals,
+    };
+  }
+
+  if (classification.listing_type === "agencia" || agency.length > 0) {
+    return {
+      status: "rejected",
+      confidence: Math.max(classification.listing_type === "agencia" ? classification.confidence : 0.8, 0.8),
+      reason: classification.listing_type === "agencia" ? classification.reason : "Señales de agencia/profesional",
+      evidence: [...classification.evidence, ...agency].slice(0, 8),
+    };
+  }
+
+  if (privateSignals.length > 0) {
+    return {
+      status: "candidate",
+      confidence: Math.max(classification.confidence, 0.68),
+      reason: "Hay señales de trato directo, pero no alcanzan el umbral de confirmado",
+      evidence: privateSignals.slice(0, 8),
+    };
+  }
+
+  if (detailWasFetched(listing)) {
+    return {
+      status: "candidate",
+      confidence: Math.max(classification.confidence, 0.52),
+      reason: "Ficha revisada sin señales claras de agencia; requiere revisión comercial",
+      evidence: ["detalle consultado", "sin señales de agencia"],
+    };
+  }
+
+  return {
+    status: "unknown",
+    confidence: classification.confidence,
+    reason: "Sin evidencia suficiente para confirmar ni descartar particular",
+    evidence: classification.evidence,
+  };
+}
+
 function parseOllamaJson(value: unknown): Partial<ListingTypeClassification> | null {
   if (typeof value !== "string") return null;
   const trimmed = value.trim();
@@ -357,6 +458,7 @@ export async function enrichListingType<T extends ClassifiableListing>(listing: 
   const accepted =
     classification.listing_type !== "unknown" &&
     classification.confidence >= threshold;
+  const privateLead = privateLeadAssessment(listing, classification, threshold);
 
   const raw = asRecord(listing.raw) ?? { value: listing.raw };
   return {
@@ -365,6 +467,7 @@ export async function enrichListingType<T extends ClassifiableListing>(listing: 
     raw: {
       ...raw,
       _listingTypeClassification: classification,
+      _privateLead: privateLead,
     },
   };
 }

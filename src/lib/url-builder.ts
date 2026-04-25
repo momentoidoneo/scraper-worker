@@ -99,13 +99,12 @@ export function normalizeSearchParams(raw: RawSearchParams): SearchParams {
 
 function idealistaFilters(p: SearchParams): string {
   const filters: string[] = [];
+  if (p.property_type === "piso") filters.push("solo-pisos");
   if (p.price_min) filters.push(`precio-desde_${p.price_min}`);
   if (p.price_max) filters.push(`precio-hasta_${p.price_max}`);
   if (p.surface_min) filters.push(`metros-cuadrados-mas-de_${p.surface_min}`);
   if (p.surface_max) filters.push(`metros-cuadrados-menos-de_${p.surface_max}`);
   if (p.rooms_min) filters.push(`de-${p.rooms_min}-dormitorios`);
-  if (p.listing_type === "particular") filters.push("publicado-por_particular");
-  if (p.listing_type === "agencia") filters.push("publicado-por_agencias");
   return filters.length ? `con-${filters.join(",")}/` : "";
 }
 

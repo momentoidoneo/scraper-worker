@@ -5,6 +5,7 @@ import { scrapeIdealista } from "./adapters/idealista.js";
 import { scrapeFotocasa } from "./adapters/fotocasa.js";
 import { scrapeHabitaclia } from "./adapters/habitaclia.js";
 import { enrichListingType } from "./lib/listing-classifier.js";
+import { enrichListingDetailsForPrivateSearch } from "./lib/listing-detail-enricher.js";
 import { normalizeSearchParams, type RawSearchParams } from "./lib/url-builder.js";
 import { recordJobDone } from "./heartbeat.js";
 
@@ -154,6 +155,27 @@ function canonicalListingType(value: unknown): "particular" | "agencia" | null {
   return null;
 }
 
+function envFlag(name: string, fallback: boolean): boolean {
+  const value = normalizeText(process.env[name]);
+  if (!value) return fallback;
+  return !["0", "false", "no", "off", "disabled"].includes(value);
+}
+
+function privateCandidateThreshold(): number {
+  const parsed = Number.parseFloat(process.env.PARTICULAR_CANDIDATE_MIN_CONFIDENCE ?? "0.5");
+  return Number.isFinite(parsed) ? Math.min(Math.max(parsed, 0), 1) : 0.5;
+}
+
+function isPrivateLeadCandidate(raw: Record<string, unknown> | null): boolean {
+  if (!envFlag("PARTICULAR_CANDIDATES_ENABLED", true)) return false;
+  const privateLead = asRecord(raw?._privateLead);
+  if (!privateLead || privateLead.status !== "candidate") return false;
+  const confidence = typeof privateLead.confidence === "number"
+    ? privateLead.confidence
+    : Number(privateLead.confidence ?? 0);
+  return Number.isFinite(confidence) && confidence >= privateCandidateThreshold();
+}
+
 function listingTypeMatches(result: ScrapedListing, requested: string | undefined): boolean {
   const desired = canonicalListingType(requested);
   const requestedText = normalizeText(requested);
@@ -167,7 +189,9 @@ function listingTypeMatches(result: ScrapedListing, requested: string | undefine
       ? classifier.confidence
       : Number(classifier.confidence ?? 0);
     const threshold = Number.parseFloat(process.env.LISTING_CLASSIFIER_MIN_CONFIDENCE ?? "0.75");
-    return classified === desired && Number.isFinite(confidence) && confidence >= threshold;
+    if (classified === desired && Number.isFinite(confidence) && confidence >= threshold) return true;
+    if (desired === "particular" && isPrivateLeadCandidate(raw)) return true;
+    return false;
   }
 
   const contactInfo = asRecord(raw?.contactInfo);
@@ -289,21 +313,29 @@ async function enrichListingTypesForFilter(
     return results;
   }
 
+  const candidateResults = desired === "particular"
+    ? await enrichListingDetailsForPrivateSearch(results, portal)
+    : results;
   const enriched: ScrapedListing[] = [];
   const stats: Record<string, number> = {};
-  for (const result of results) {
+  const privateLeadStats: Record<string, number> = {};
+  for (const result of candidateResults) {
     const classified = await enrichListingType(result);
     const raw = asRecord(classified.raw);
     const classification = asRecord(raw?._listingTypeClassification);
+    const privateLead = asRecord(raw?._privateLead);
     const source = String(classification?.source ?? "none");
     const listingType = String(classification?.listing_type ?? "none");
     const key = `${source}:${listingType}`;
     stats[key] = (stats[key] ?? 0) + 1;
+    const leadStatus = String(privateLead?.status ?? "none");
+    privateLeadStats[leadStatus] = (privateLeadStats[leadStatus] ?? 0) + 1;
     enriched.push(classified);
   }
 
   if (results.length) {
     console.log(`[classifier] portal=${portal} requested=${desired} stats=${JSON.stringify(stats)}`);
+    console.log(`[private-leads] portal=${portal} stats=${JSON.stringify(privateLeadStats)}`);
   }
 
   return enriched;
