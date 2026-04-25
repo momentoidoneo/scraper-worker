@@ -36,8 +36,8 @@ function requiredToken(): string {
 }
 
 function desiredResults(): number {
-  const parsed = Number.parseInt(process.env.APIFY_IDEALISTA_DESIRED_RESULTS ?? "20", 10);
-  if (!Number.isFinite(parsed)) return 20;
+  const parsed = Number.parseInt(process.env.APIFY_IDEALISTA_DESIRED_RESULTS ?? "100", 10);
+  if (!Number.isFinite(parsed)) return 100;
   return Math.max(10, Math.min(parsed, 100));
 }
 
