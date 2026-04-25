@@ -200,6 +200,7 @@ async function enrichWithProxy<T extends EnrichableListing>(
           },
         };
       } catch (err) {
+        if (proxy && isLikelyProxyFailure(err)) throw err;
         const raw = asRecord(listing.raw) ?? { value: listing.raw };
         listings[index] = {
           ...listing,
