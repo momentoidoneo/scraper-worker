@@ -76,6 +76,14 @@ function canonicalPropertyType(value: string | undefined): string {
   return value ?? "piso";
 }
 
+function isPrivateListingType(value: string | undefined): boolean {
+  const text = (value ?? "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase();
+  return /\b(particular|particulares|private|privado|propietario)\b/.test(text);
+}
+
 export function normalizeSearchParams(raw: RawSearchParams): SearchParams {
   const propertyTypes = stringArray(raw.propertyTypes, raw.property_types, raw.property_type);
   const normalizedPropertyTypes = propertyTypes.map(canonicalPropertyType).filter(Boolean);
@@ -127,6 +135,8 @@ export function buildFotocasaUrl(input: RawSearchParams): string {
   const type = p.property_type === "casa" ? "casas" : p.property_type === "local" ? "locales" :
     p.property_type === "oficina" ? "oficinas" : p.property_type === "garaje" ? "garajes" : "viviendas";
   const slug = slugifyCity(p.city);
+  const privatePath = isPrivateListingType(p.listing_type) ? "/particulares" : "";
+  const listSuffix = privatePath ? "pl" : "l";
   const qs = new URLSearchParams();
   if (p.price_min) qs.set("minPrice", String(p.price_min));
   if (p.price_max) qs.set("maxPrice", String(p.price_max));
@@ -134,7 +144,7 @@ export function buildFotocasaUrl(input: RawSearchParams): string {
   if (p.surface_max) qs.set("maxSurface", String(p.surface_max));
   if (p.rooms_min) qs.set("minRooms", String(p.rooms_min));
   const query = qs.toString();
-  return `https://www.fotocasa.es/es/${op}/${type}/${slug}-capital/todas-las-zonas/l${query ? `?${query}` : ""}`;
+  return `https://www.fotocasa.es/es/${op}/${type}${privatePath}/${slug}-capital/todas-las-zonas/${listSuffix}${query ? `?${query}` : ""}`;
 }
 
 // --- HABITACLIA ---
@@ -145,7 +155,8 @@ export function buildHabitacliaUrl(input: RawSearchParams): string {
   const slug = slugifyCity(p.city);
   const isRental = p.operation === "alquiler" || p.operation === "alquiler_temporal";
   const type = p.property_type === "casa" ? "casas" : p.property_type === "local" ? "locales" : "pisos";
-  const cheapSuffix = !isRental && p.price_max && type === "pisos" ? "-baratos" : "";
-  const prefix = isRental ? `alquiler-${type}` : `${type}${cheapSuffix}`;
+  const privateSuffix = isPrivateListingType(p.listing_type) ? "-particulares" : "";
+  const cheapSuffix = !privateSuffix && !isRental && p.price_max && type === "pisos" ? "-baratos" : "";
+  const prefix = isRental ? `alquiler-${type}${privateSuffix}` : `${type}${privateSuffix}${cheapSuffix}`;
   return `https://www.habitaclia.com/${prefix}-${slug}.htm`;
 }
