@@ -35,11 +35,17 @@ function envInt(name: string, fallback: number, min: number, max: number): numbe
 
 const MAX_SCROLLS = envInt("FOTOCASA_MAX_SCROLLS", 14, 0, 40);
 const MAX_RESULTS = envInt("FOTOCASA_MAX_RESULTS", 80, 10, 200);
+const SEGMENT_DELAY_MS = envInt("FOTOCASA_SEGMENT_DELAY_MS", 3500, 0, 15000);
+const SEGMENT_RETRY_DELAY_MS = envInt("FOTOCASA_SEGMENT_RETRY_DELAY_MS", 10000, 0, 30000);
 
 function envFlag(name: string, fallback: boolean): boolean {
   const value = (process.env[name] ?? "").trim().toLowerCase();
   if (!value) return fallback;
   return !["0", "false", "no", "off", "disabled"].includes(value);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function normalizeText(value: unknown): string {
@@ -254,7 +260,6 @@ async function scrapeFotocasaWithProxy(
   );
 
   let browser: Browser | null = null;
-  let context: BrowserContext | null = null;
   try {
     browser = await chromium.launch({
       headless: true,
@@ -266,76 +271,103 @@ async function scrapeFotocasaWithProxy(
           }
         : undefined,
     });
-    context = await browser.newContext({
-      userAgent: UA,
-      locale: "es-ES",
-      viewport: { width: 1366, height: 900 },
-    });
-    const page = await context.newPage();
 
     const globalMap = new Map<string, Listing>();
     let totalRawNodes = 0;
-    for (const segment of segments) {
+
+    const scrapeSegment = async (
+      segment: (typeof segments)[number],
+      segmentIndex: number,
+      attempt: number,
+    ): Promise<{ listings: Listing[]; rawNodes: number; blocked: boolean }> => {
       const url = buildFotocasaUrl(segment.params);
-      console.log(`[fotocasa] goto segment=${segment.label} url=${url}`);
+      console.log(`[fotocasa] goto segment=${segment.label} attempt=${attempt + 1} url=${url}`);
 
-      const resp = await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
-      await page.waitForTimeout(1500);
-      const status = resp?.status() ?? 0;
-      const finalUrl = page.url();
-      const html = await page.content();
-      const bytes = Buffer.byteLength(html, "utf8");
+      const context = await browser!.newContext({
+        userAgent: UA,
+        locale: "es-ES",
+        viewport: { width: 1366, height: 900 },
+      });
+      try {
+        const page = await context.newPage();
 
-      console.log(`[fotocasa] status=${status} segment=${segment.label} finalUrl=${finalUrl} htmlBytes=${bytes}`);
-      if (segment === segments[0]) {
-        console.log(`[fotocasa] htmlPreview=${html.slice(0, 500).replace(/\n/g, " ")}`);
-      }
+        const resp = await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+        await page.waitForTimeout(1500);
+        const status = resp?.status() ?? 0;
+        const finalUrl = page.url();
+        const html = await page.content();
+        const bytes = Buffer.byteLength(html, "utf8");
 
-      const lower = html.toLowerCase();
-      const blockHints: string[] = [];
-      if (lower.includes("captcha")) blockHints.push("captcha");
-      if (lower.includes("datadome")) blockHints.push("datadome");
-      if (status === 403 || status === 429) blockHints.push(`http-${status}`);
-      if (blockHints.length) {
-        console.log(`[fotocasa] blockHints=${blockHints.join("|")}`);
-      }
-
-      const selector = "article";
-      const rawNodes = await page.$$eval(selector, (nodes) => nodes.length);
-      totalRawNodes += rawNodes;
-      const segmentMap = new Map<string, Listing>();
-      let staleScrolls = 0;
-      for (let scroll = 0; scroll <= MAX_SCROLLS && segmentMap.size < segment.maxResults; scroll += 1) {
-        const before = segmentMap.size;
-        for (const listing of await collectVisibleListings(page)) {
-          const raw = listing.raw && typeof listing.raw === "object" && !Array.isArray(listing.raw)
-            ? listing.raw as Record<string, unknown>
-            : {};
-          const enrichedListing = {
-            ...listing,
-            raw: { ...raw, searchSegment: segment.label },
-          };
-          const existing = segmentMap.get(listing.external_id);
-          if (!existing || listingQualityScore(enrichedListing) > listingQualityScore(existing)) {
-            segmentMap.set(listing.external_id, enrichedListing);
-          }
+        console.log(`[fotocasa] status=${status} segment=${segment.label} finalUrl=${finalUrl} htmlBytes=${bytes}`);
+        if (segmentIndex === 0 && attempt === 0) {
+          console.log(`[fotocasa] htmlPreview=${html.slice(0, 500).replace(/\n/g, " ")}`);
         }
 
-        staleScrolls = segmentMap.size === before ? staleScrolls + 1 : 0;
-        if (staleScrolls >= 4) break;
-        await page.evaluate(() => {
-          window.scrollBy(0, Math.max(900, Math.floor(window.innerHeight * 0.95)));
-        });
-        await page.waitForTimeout(1200);
+        const lower = html.toLowerCase();
+        const blockHints: string[] = [];
+        if (lower.includes("captcha")) blockHints.push("captcha");
+        if (lower.includes("datadome")) blockHints.push("datadome");
+        if (status === 403 || status === 429) blockHints.push(`http-${status}`);
+        if (blockHints.length) {
+          console.log(`[fotocasa] blockHints=${blockHints.join("|")}`);
+        }
+
+        const selector = "article";
+        const rawNodes = await page.$$eval(selector, (nodes) => nodes.length);
+        const segmentMap = new Map<string, Listing>();
+        if (blockHints.length && rawNodes === 0) {
+          console.log(`[fotocasa] segment=${segment.label} blocked before extraction`);
+          return { listings: [], rawNodes, blocked: true };
+        }
+
+        let staleScrolls = 0;
+        for (let scroll = 0; scroll <= MAX_SCROLLS && segmentMap.size < segment.maxResults; scroll += 1) {
+          const before = segmentMap.size;
+          for (const listing of await collectVisibleListings(page)) {
+            const raw = listing.raw && typeof listing.raw === "object" && !Array.isArray(listing.raw)
+              ? listing.raw as Record<string, unknown>
+              : {};
+            const enrichedListing = {
+              ...listing,
+              raw: { ...raw, searchSegment: segment.label },
+            };
+            const existing = segmentMap.get(listing.external_id);
+            if (!existing || listingQualityScore(enrichedListing) > listingQualityScore(existing)) {
+              segmentMap.set(listing.external_id, enrichedListing);
+            }
+          }
+
+          staleScrolls = segmentMap.size === before ? staleScrolls + 1 : 0;
+          if (staleScrolls >= 4) break;
+          await page.evaluate(() => {
+            window.scrollBy(0, Math.max(900, Math.floor(window.innerHeight * 0.95)));
+          });
+          await page.waitForTimeout(1200);
+        }
+
+        console.log(`[fotocasa] segment=${segment.label} extractedCards=${rawNodes} withId=${segmentMap.size}`);
+        return { listings: Array.from(segmentMap.values()), rawNodes, blocked: blockHints.length > 0 && segmentMap.size === 0 };
+      } finally {
+        await context.close().catch(() => {});
+      }
+    };
+
+    for (const [segmentIndex, segment] of segments.entries()) {
+      if (segmentIndex > 0 && SEGMENT_DELAY_MS > 0) await sleep(SEGMENT_DELAY_MS);
+      let result = await scrapeSegment(segment, segmentIndex, 0);
+      if (result.blocked && SEGMENT_RETRY_DELAY_MS > 0) {
+        console.log(`[fotocasa] retry segment=${segment.label} after ${SEGMENT_RETRY_DELAY_MS}ms`);
+        await sleep(SEGMENT_RETRY_DELAY_MS);
+        result = await scrapeSegment(segment, segmentIndex, 1);
       }
 
-      for (const listing of segmentMap.values()) {
+      totalRawNodes += result.rawNodes;
+      for (const listing of result.listings) {
         const existing = globalMap.get(listing.external_id);
         if (!existing || listingQualityScore(listing) > listingQualityScore(existing)) {
           globalMap.set(listing.external_id, listing);
         }
       }
-      console.log(`[fotocasa] segment=${segment.label} extractedCards=${rawNodes} withId=${segmentMap.size}`);
     }
     const listings = Array.from(globalMap.values()).slice(0, MAX_RESULTS);
 
@@ -352,7 +384,6 @@ async function scrapeFotocasaWithProxy(
     console.error(`[fotocasa] FATAL`, err);
     throw err;
   } finally {
-    await context?.close().catch(() => {});
     await browser?.close().catch(() => {});
   }
 }
