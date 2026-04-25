@@ -205,8 +205,10 @@ async function scrapeFotocasaWithProxy(
 
       staleScrolls = listingMap.size === before ? staleScrolls + 1 : 0;
       if (staleScrolls >= 4) break;
-      await page.mouse.wheel(0, 1200);
-      await page.waitForTimeout(700);
+      await page.evaluate(() => {
+        window.scrollBy(0, Math.max(900, Math.floor(window.innerHeight * 0.95)));
+      });
+      await page.waitForTimeout(1200);
     }
     const listings = Array.from(listingMap.values()).slice(0, MAX_RESULTS);
 
