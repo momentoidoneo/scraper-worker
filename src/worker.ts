@@ -160,6 +160,16 @@ function listingTypeMatches(result: ScrapedListing, requested: string | undefine
   if (!desired || requestedText === "ambos" || requestedText === "any" || requestedText === "todos") return true;
 
   const raw = asRecord(result.raw);
+  const classifier = asRecord(raw?._listingTypeClassification);
+  if (classifier) {
+    const classified = canonicalListingType(classifier.listing_type);
+    const confidence = typeof classifier.confidence === "number"
+      ? classifier.confidence
+      : Number(classifier.confidence ?? 0);
+    const threshold = Number.parseFloat(process.env.LISTING_CLASSIFIER_MIN_CONFIDENCE ?? "0.75");
+    return classified === desired && Number.isFinite(confidence) && confidence >= threshold;
+  }
+
   const contactInfo = asRecord(raw?.contactInfo);
   const detected = [
     result.listing_type,

@@ -206,6 +206,23 @@ function textClassification(listing: ClassifiableListing): ListingTypeClassifica
   return null;
 }
 
+function hasPositivePrivateSignal(value: string): boolean {
+  const text = normalizeText(value);
+  return [
+    /\b(?:sin|no)\s+(?:agencias|intermediarios|inmobiliarias)\b/,
+    /\babstenerse\s+(?:agencias|intermediarios|inmobiliarias)\b/,
+    /\btrato\s+directo\b/,
+    /\bsin\s+comision(?:es)?\s+de\s+agencia\b/,
+    /\bdirecto\s+(?:con\s+)?(?:propietario|propietaria|dueno|duena)\b/,
+    /\b(?:soy|somos)\s+(?:el\s+|la\s+|los\s+|las\s+)?(?:propietario|propietaria|dueno|duena)\b/,
+    /\b(?:particular|propietario|propietaria|dueno|duena)\s+(?:vende|alquila|ofrece)\b/,
+    /\b(?:vende|alquila|ofrece)\s+(?:particular|propietario|propietaria|dueno|duena)\b/,
+    /\bde\s+particular\s+a\s+particular\b/,
+    /\banunciante\s+particular\b/,
+    /\bprivate\s+(?:advertiser|user|owner)\b/,
+  ].some((pattern) => pattern.test(text));
+}
+
 function parseOllamaJson(value: unknown): Partial<ListingTypeClassification> | null {
   if (typeof value !== "string") return null;
   const trimmed = value.trim();
@@ -288,8 +305,24 @@ async function classifyWithOllama(listing: ClassifiableListing): Promise<Listing
     const confidence = Number.isFinite(classification.confidence)
       ? Math.min(Math.max(Number(classification.confidence), 0), 1)
       : 0;
+    const listingType = classification.listing_type ?? "unknown";
+    const combinedEvidence = [
+      listingContext(listing),
+      classification.reason,
+      ...(classification.evidence ?? []),
+    ].join("\n");
+    if (listingType === "particular" && !hasPositivePrivateSignal(combinedEvidence)) {
+      return {
+        listing_type: "unknown",
+        confidence: 0,
+        source: "ollama",
+        reason: "Ollama no aportó evidencia positiva de anunciante particular",
+        evidence: classification.evidence ?? [],
+      };
+    }
+
     return {
-      listing_type: classification.listing_type ?? "unknown",
+      listing_type: listingType,
       confidence,
       source: "ollama",
       reason: classification.reason ?? "Respuesta de Ollama",
