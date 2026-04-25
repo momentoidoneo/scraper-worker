@@ -36,6 +36,86 @@ function envInt(name: string, fallback: number, min: number, max: number): numbe
 const MAX_SCROLLS = envInt("FOTOCASA_MAX_SCROLLS", 14, 0, 40);
 const MAX_RESULTS = envInt("FOTOCASA_MAX_RESULTS", 80, 10, 200);
 
+function envFlag(name: string, fallback: boolean): boolean {
+  const value = (process.env[name] ?? "").trim().toLowerCase();
+  if (!value) return fallback;
+  return !["0", "false", "no", "off", "disabled"].includes(value);
+}
+
+function normalizeText(value: unknown): string {
+  return String(value ?? "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .trim();
+}
+
+function priceBandsFor(operation: string): Array<{ price_min?: number; price_max?: number }> {
+  const rental = operation === "alquiler" || operation === "alquiler_temporal" || operation === "rent";
+  if (rental) {
+    return [
+      { price_max: 800 },
+      { price_min: 800, price_max: 1200 },
+      { price_min: 1200, price_max: 1800 },
+      { price_min: 1800, price_max: 3000 },
+      { price_min: 3000 },
+    ];
+  }
+
+  return [
+    { price_max: 150000 },
+    { price_min: 150000, price_max: 250000 },
+    { price_min: 250000, price_max: 400000 },
+    { price_min: 400000, price_max: 700000 },
+    { price_min: 700000, price_max: 1200000 },
+    { price_min: 1200000 },
+  ];
+}
+
+function intersectPriceBand(
+  band: { price_min?: number; price_max?: number },
+  params: SearchParams,
+): { price_min?: number; price_max?: number } | null {
+  const min = Math.max(band.price_min ?? Number.NEGATIVE_INFINITY, params.price_min ?? Number.NEGATIVE_INFINITY);
+  const max = Math.min(band.price_max ?? Number.POSITIVE_INFINITY, params.price_max ?? Number.POSITIVE_INFINITY);
+  if (Number.isFinite(min) && Number.isFinite(max) && min >= max) return null;
+  return {
+    price_min: Number.isFinite(min) ? min : undefined,
+    price_max: Number.isFinite(max) ? max : undefined,
+  };
+}
+
+function segmentLabel(segment: { price_min?: number; price_max?: number }): string {
+  if (segment.price_min != null && segment.price_max != null) return `${segment.price_min}-${segment.price_max}`;
+  if (segment.price_min != null) return `from-${segment.price_min}`;
+  if (segment.price_max != null) return `to-${segment.price_max}`;
+  return "all";
+}
+
+function searchSegments(params: SearchParams): Array<{ params: SearchParams; label: string; maxResults: number }> {
+  const desired = Math.max(10, MAX_RESULTS);
+  const wantsPrivate = normalizeText(params.listing_type) === "particular";
+  const enabled = envFlag("FOTOCASA_SEGMENTED_SEARCH", true);
+  if (!enabled || (!wantsPrivate && desired < 100)) {
+    return [{ params, label: "all", maxResults: desired }];
+  }
+
+  const segments = priceBandsFor(params.operation)
+    .map((band) => intersectPriceBand(band, params))
+    .filter((band): band is { price_min?: number; price_max?: number } => Boolean(band));
+
+  if (segments.length <= 1) {
+    return [{ params, label: "all", maxResults: desired }];
+  }
+
+  const perSegment = Math.max(18, Math.ceil(desired / segments.length));
+  return segments.map((segment) => ({
+    params: { ...params, ...segment },
+    label: segmentLabel(segment),
+    maxResults: perSegment,
+  }));
+}
+
 function listingQualityScore(listing: Listing): number {
   const title = (listing.title || "")
     .normalize("NFD")
@@ -165,10 +245,10 @@ async function scrapeFotocasaWithProxy(
   params: SearchParams,
   proxy: ReturnType<typeof getProxyConfigFor>,
 ): Promise<Listing[]> {
-  const url = buildFotocasaUrl(params);
+  const segments = searchSegments(params);
 
   console.log(
-    `[fotocasa] goto url=${url} params=${JSON.stringify(params)} proxy=${
+    `[fotocasa] searches=${segments.length} maxTotal=${MAX_RESULTS} params=${JSON.stringify(params)} proxy=${
       proxy ? proxy.server : "none"
     }`
   );
@@ -193,49 +273,74 @@ async function scrapeFotocasaWithProxy(
     });
     const page = await context.newPage();
 
-    const resp = await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
-    await page.waitForTimeout(1500);
-    const status = resp?.status() ?? 0;
-    const finalUrl = page.url();
-    const html = await page.content();
-    const bytes = Buffer.byteLength(html, "utf8");
+    const globalMap = new Map<string, Listing>();
+    let totalRawNodes = 0;
+    for (const segment of segments) {
+      const url = buildFotocasaUrl(segment.params);
+      console.log(`[fotocasa] goto segment=${segment.label} url=${url}`);
 
-    console.log(`[fotocasa] status=${status} finalUrl=${finalUrl} htmlBytes=${bytes}`);
-    console.log(`[fotocasa] htmlPreview=${html.slice(0, 500).replace(/\n/g, " ")}`);
+      const resp = await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+      await page.waitForTimeout(1500);
+      const status = resp?.status() ?? 0;
+      const finalUrl = page.url();
+      const html = await page.content();
+      const bytes = Buffer.byteLength(html, "utf8");
 
-    const lower = html.toLowerCase();
-    const blockHints: string[] = [];
-    if (lower.includes("captcha")) blockHints.push("captcha");
-    if (lower.includes("datadome")) blockHints.push("datadome");
-    if (status === 403 || status === 429) blockHints.push(`http-${status}`);
-    if (blockHints.length) {
-      console.log(`[fotocasa] blockHints=${blockHints.join("|")}`);
-    }
-
-    const selector = "article";
-    const rawNodes = await page.$$eval(selector, (nodes) => nodes.length);
-    const listingMap = new Map<string, Listing>();
-    let staleScrolls = 0;
-    for (let scroll = 0; scroll <= MAX_SCROLLS && listingMap.size < MAX_RESULTS; scroll += 1) {
-      const before = listingMap.size;
-      for (const listing of await collectVisibleListings(page)) {
-        const existing = listingMap.get(listing.external_id);
-        if (!existing || listingQualityScore(listing) > listingQualityScore(existing)) {
-          listingMap.set(listing.external_id, listing);
-        }
+      console.log(`[fotocasa] status=${status} segment=${segment.label} finalUrl=${finalUrl} htmlBytes=${bytes}`);
+      if (segment === segments[0]) {
+        console.log(`[fotocasa] htmlPreview=${html.slice(0, 500).replace(/\n/g, " ")}`);
       }
 
-      staleScrolls = listingMap.size === before ? staleScrolls + 1 : 0;
-      if (staleScrolls >= 4) break;
-      await page.evaluate(() => {
-        window.scrollBy(0, Math.max(900, Math.floor(window.innerHeight * 0.95)));
-      });
-      await page.waitForTimeout(1200);
-    }
-    const listings = Array.from(listingMap.values()).slice(0, MAX_RESULTS);
+      const lower = html.toLowerCase();
+      const blockHints: string[] = [];
+      if (lower.includes("captcha")) blockHints.push("captcha");
+      if (lower.includes("datadome")) blockHints.push("datadome");
+      if (status === 403 || status === 429) blockHints.push(`http-${status}`);
+      if (blockHints.length) {
+        console.log(`[fotocasa] blockHints=${blockHints.join("|")}`);
+      }
 
-    console.log(`[fotocasa] selector="${selector}" matchedNodes=${rawNodes}`);
-    console.log(`[fotocasa] extractedCards=${rawNodes} withId=${listings.length} scrolls=${MAX_SCROLLS}`);
+      const selector = "article";
+      const rawNodes = await page.$$eval(selector, (nodes) => nodes.length);
+      totalRawNodes += rawNodes;
+      const segmentMap = new Map<string, Listing>();
+      let staleScrolls = 0;
+      for (let scroll = 0; scroll <= MAX_SCROLLS && segmentMap.size < segment.maxResults; scroll += 1) {
+        const before = segmentMap.size;
+        for (const listing of await collectVisibleListings(page)) {
+          const raw = listing.raw && typeof listing.raw === "object" && !Array.isArray(listing.raw)
+            ? listing.raw as Record<string, unknown>
+            : {};
+          const enrichedListing = {
+            ...listing,
+            raw: { ...raw, searchSegment: segment.label },
+          };
+          const existing = segmentMap.get(listing.external_id);
+          if (!existing || listingQualityScore(enrichedListing) > listingQualityScore(existing)) {
+            segmentMap.set(listing.external_id, enrichedListing);
+          }
+        }
+
+        staleScrolls = segmentMap.size === before ? staleScrolls + 1 : 0;
+        if (staleScrolls >= 4) break;
+        await page.evaluate(() => {
+          window.scrollBy(0, Math.max(900, Math.floor(window.innerHeight * 0.95)));
+        });
+        await page.waitForTimeout(1200);
+      }
+
+      for (const listing of segmentMap.values()) {
+        const existing = globalMap.get(listing.external_id);
+        if (!existing || listingQualityScore(listing) > listingQualityScore(existing)) {
+          globalMap.set(listing.external_id, listing);
+        }
+      }
+      console.log(`[fotocasa] segment=${segment.label} extractedCards=${rawNodes} withId=${segmentMap.size}`);
+    }
+    const listings = Array.from(globalMap.values()).slice(0, MAX_RESULTS);
+
+    console.log(`[fotocasa] selector="article" matchedNodes=${totalRawNodes}`);
+    console.log(`[fotocasa] extractedCards=${totalRawNodes} withId=${listings.length} scrolls=${MAX_SCROLLS} searches=${segments.length}`);
     if (listings.length === 0) {
       console.log(
         `[fotocasa] no listings extracted (selector may be stale or page is a captcha/empty shell)`

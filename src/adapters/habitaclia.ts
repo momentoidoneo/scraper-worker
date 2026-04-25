@@ -36,6 +36,24 @@ function envInt(name: string, fallback: number, min: number, max: number): numbe
 const MAX_PAGES = envInt("HABITACLIA_MAX_PAGES", 5, 1, 25);
 const MAX_RESULTS = envInt("HABITACLIA_MAX_RESULTS", 90, 10, 300);
 
+function normalizeText(value: unknown): string {
+  return String(value ?? "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .trim();
+}
+
+function maxPagesFor(params: SearchParams): number {
+  if (normalizeText(params.listing_type) !== "particular") return MAX_PAGES;
+  return envInt("HABITACLIA_PRIVATE_MAX_PAGES", Math.max(MAX_PAGES, 12), 1, 40);
+}
+
+function maxResultsFor(params: SearchParams): number {
+  if (normalizeText(params.listing_type) !== "particular") return MAX_RESULTS;
+  return envInt("HABITACLIA_PRIVATE_MAX_RESULTS", Math.max(MAX_RESULTS, 180), 10, 400);
+}
+
 function pageUrl(url: string, pageIndex: number): string {
   if (pageIndex === 0) return url;
   return url.replace(/\.htm(?:\?.*)?$/, `-${pageIndex}.htm`);
@@ -132,7 +150,7 @@ async function collectVisibleListings(page: Page, expectedHrefPart: string): Pro
         rooms: firstNumber(text, /(\d+)\s*(?:habitaciones?|habs?)/i),
         bathrooms: firstNumber(text, /(\d+)\s*baños?/i),
         property_type: detectPropertyType(title + " " + href + " " + text),
-        listing_type: detectListingType(title + " " + href + " " + text + advertiserHint),
+        listing_type: advertiserHint ? "agencia" : detectListingType(title + " " + href + " " + text),
         published_at: publishedAt(text),
         images,
         raw: { textPreview: text.slice(0, 1200), advertiserHint: advertiserHint.trim() || null },
@@ -176,9 +194,11 @@ async function scrapeHabitacliaWithProxy(
     const page = await context.newPage();
     const selector = "article.js-list-item[data-id], article.list-item-container[data-id]";
     const expectedHrefPart = params.operation === "alquiler" || params.operation === "alquiler_temporal" ? "alquiler-" : "comprar-";
+    const maxPages = maxPagesFor(params);
+    const maxResults = maxResultsFor(params);
     let rawNodes = 0;
     const listingMap = new Map<string, Listing>();
-    for (let pageIndex = 0; pageIndex < MAX_PAGES && listingMap.size < MAX_RESULTS; pageIndex += 1) {
+    for (let pageIndex = 0; pageIndex < maxPages && listingMap.size < maxResults; pageIndex += 1) {
       const currentUrl = pageUrl(url, pageIndex);
       const resp = await page.goto(currentUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
       await page.waitForTimeout(1000);
@@ -187,7 +207,7 @@ async function scrapeHabitacliaWithProxy(
       const html = await page.content();
       const bytes = Buffer.byteLength(html, "utf8");
 
-      console.log(`[habitaclia] status=${status} page=${pageIndex + 1}/${MAX_PAGES} finalUrl=${finalUrl} htmlBytes=${bytes}`);
+      console.log(`[habitaclia] status=${status} page=${pageIndex + 1}/${maxPages} finalUrl=${finalUrl} htmlBytes=${bytes}`);
       if (pageIndex === 0) {
         console.log(`[habitaclia] htmlPreview=${html.slice(0, 500).replace(/\n/g, " ")}`);
       }
@@ -207,9 +227,9 @@ async function scrapeHabitacliaWithProxy(
         if (!listingMap.has(listing.external_id)) listingMap.set(listing.external_id, listing);
       }
     }
-    const listings = Array.from(listingMap.values()).slice(0, MAX_RESULTS);
+    const listings = Array.from(listingMap.values()).slice(0, maxResults);
 
-    console.log(`[habitaclia] selector="${selector}" matchedNodes=${rawNodes} pages=${MAX_PAGES}`);
+    console.log(`[habitaclia] selector="${selector}" matchedNodes=${rawNodes} pages=${maxPages}`);
     console.log(`[habitaclia] extractedCards=${rawNodes} withId=${listings.length}`);
     if (listings.length === 0) {
       console.log(
