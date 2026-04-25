@@ -36,6 +36,24 @@ function envInt(name: string, fallback: number, min: number, max: number): numbe
 const MAX_SCROLLS = envInt("FOTOCASA_MAX_SCROLLS", 14, 0, 40);
 const MAX_RESULTS = envInt("FOTOCASA_MAX_RESULTS", 80, 10, 200);
 
+function listingQualityScore(listing: Listing): number {
+  const title = (listing.title || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase();
+  const raw = listing.raw && typeof listing.raw === "object" && !Array.isArray(listing.raw)
+    ? listing.raw as Record<string, unknown>
+    : {};
+  let score = 0;
+  if (/\b(?:piso|casa|atico|apartamento|chalet|duplex|local|loft|estudio|vivienda)\b/.test(title)) score += 10;
+  if (listing.price != null) score += 2;
+  if (listing.surface_m2 != null) score += 1;
+  if (listing.rooms != null) score += 1;
+  if (String(raw.textPreview ?? "").length > 400) score += 1;
+  if (raw.advertiserHint) score += 1;
+  return score;
+}
+
 async function collectVisibleListings(page: Page): Promise<Listing[]> {
   const selector = "article";
   return (await page.$$eval(selector, (nodes) => {
@@ -114,6 +132,7 @@ async function collectVisibleListings(page: Page): Promise<Listing[]> {
       if (!id || seen.has(id)) continue;
 
       const text = normalize(node.textContent);
+      const advertiserHint = anchors.some((link) => (link.getAttribute("href") || "").includes("/inmobiliaria-")) ? " inmobiliaria" : "";
       const title = normalize(titleLink.textContent) || normalize((node.querySelector("img[alt]") as HTMLImageElement | null)?.alt) || "(sin título)";
       const images = Array.from(node.querySelectorAll("img"))
         .map((img) => img.getAttribute("src") || img.getAttribute("data-src") || "")
@@ -132,9 +151,9 @@ async function collectVisibleListings(page: Page): Promise<Listing[]> {
         bathrooms: firstNumber(text, /(\d+)\s*baños?/i),
         images,
         property_type: detectPropertyType(title + " " + href + " " + text),
-        listing_type: detectListingType(title + " " + href + " " + text),
+        listing_type: detectListingType(title + " " + href + " " + text + advertiserHint),
         published_at: publishedAt(text),
-        raw: { textPreview: text.slice(0, 1200) },
+        raw: { textPreview: text.slice(0, 1200), advertiserHint: advertiserHint.trim() || null },
       });
     }
 
@@ -200,7 +219,10 @@ async function scrapeFotocasaWithProxy(
     for (let scroll = 0; scroll <= MAX_SCROLLS && listingMap.size < MAX_RESULTS; scroll += 1) {
       const before = listingMap.size;
       for (const listing of await collectVisibleListings(page)) {
-        if (!listingMap.has(listing.external_id)) listingMap.set(listing.external_id, listing);
+        const existing = listingMap.get(listing.external_id);
+        if (!existing || listingQualityScore(listing) > listingQualityScore(existing)) {
+          listingMap.set(listing.external_id, listing);
+        }
       }
 
       staleScrolls = listingMap.size === before ? staleScrolls + 1 : 0;
