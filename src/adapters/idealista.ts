@@ -41,6 +41,67 @@ function desiredResults(): number {
   return Math.max(10, Math.min(parsed, 100));
 }
 
+function segmentedSearchEnabled(): boolean {
+  const value = (process.env.APIFY_IDEALISTA_SEGMENTED_SEARCH ?? "true").trim().toLowerCase();
+  return !["0", "false", "no", "off"].includes(value);
+}
+
+function priceBandsFor(operation: string): Array<{ price_min?: number; price_max?: number }> {
+  const rental = operation === "alquiler" || operation === "alquiler_temporal" || operation === "rent";
+  if (rental) {
+    return [
+      { price_max: 800 },
+      { price_min: 800, price_max: 1200 },
+      { price_min: 1200, price_max: 1800 },
+      { price_min: 1800, price_max: 3000 },
+      { price_min: 3000 },
+    ];
+  }
+
+  return [
+    { price_max: 150000 },
+    { price_min: 150000, price_max: 250000 },
+    { price_min: 250000, price_max: 400000 },
+    { price_min: 400000, price_max: 700000 },
+    { price_min: 700000, price_max: 1200000 },
+    { price_min: 1200000 },
+  ];
+}
+
+function intersectPriceBand(
+  band: { price_min?: number; price_max?: number },
+  params: SearchParams,
+): { price_min?: number; price_max?: number } | null {
+  const min = Math.max(band.price_min ?? Number.NEGATIVE_INFINITY, params.price_min ?? Number.NEGATIVE_INFINITY);
+  const max = Math.min(band.price_max ?? Number.POSITIVE_INFINITY, params.price_max ?? Number.POSITIVE_INFINITY);
+
+  if (Number.isFinite(min) && Number.isFinite(max) && min >= max) return null;
+  return {
+    price_min: Number.isFinite(min) ? min : undefined,
+    price_max: Number.isFinite(max) ? max : undefined,
+  };
+}
+
+function searchUrls(params: SearchParams, totalDesiredResults: number): Array<{ url: string; desiredResults: number }> {
+  if (!segmentedSearchEnabled() || totalDesiredResults < 30) {
+    return [{ url: buildIdealistaUrl(params), desiredResults: totalDesiredResults }];
+  }
+
+  const segments = priceBandsFor(params.operation)
+    .map((band) => intersectPriceBand(band, params))
+    .filter((band): band is { price_min?: number; price_max?: number } => Boolean(band));
+
+  if (segments.length <= 1) {
+    return [{ url: buildIdealistaUrl(params), desiredResults: totalDesiredResults }];
+  }
+
+  const perSegment = Math.max(10, Math.ceil(totalDesiredResults / segments.length));
+  return segments.map((segment) => ({
+    url: buildIdealistaUrl({ ...params, ...segment }),
+    desiredResults: perSegment,
+  }));
+}
+
 function numberValue(...values: unknown[]): number | null {
   for (const value of values) {
     if (typeof value === "number" && Number.isFinite(value)) return value;
@@ -219,18 +280,30 @@ function mapListing(item: ApifyItem, params: SearchParams): Listing | null {
 
 export async function scrapeIdealista(params: SearchParams): Promise<Listing[]> {
   const token = requiredToken();
-  const url = buildIdealistaUrl(params);
-  const payload = {
-    Property_urls: [{ url }],
-    desiredResults: desiredResults(),
-  };
+  const targetResults = desiredResults();
+  const searches = searchUrls(params, targetResults);
+  const listingMap = new Map<string, Listing>();
+  let itemCount = 0;
 
-  console.log(`[idealista] apify actor=${ACTOR_ID} url=${url} desiredResults=${payload.desiredResults}`);
-  const items = await fetchApifyItems(payload, token);
-  const listings = items
-    .map((item) => mapListing(item, params))
-    .filter((listing): listing is Listing => Boolean(listing));
+  console.log(`[idealista] apify actor=${ACTOR_ID} searches=${searches.length} desiredTotal=${targetResults}`);
+  for (const search of searches) {
+    const payload = {
+      Property_urls: [{ url: search.url }],
+      desiredResults: search.desiredResults,
+    };
 
-  console.log(`[idealista] apifyItems=${items.length} listings=${listings.length}`);
+    console.log(`[idealista] apify url=${search.url} desiredResults=${payload.desiredResults}`);
+    const items = await fetchApifyItems(payload, token);
+    itemCount += items.length;
+    for (const item of items) {
+      const listing = mapListing(item, params);
+      if (!listing) continue;
+      const key = listing.external_id || listing.url;
+      if (!listingMap.has(key)) listingMap.set(key, listing);
+    }
+  }
+
+  const listings = Array.from(listingMap.values()).slice(0, targetResults);
+  console.log(`[idealista] apifyItems=${itemCount} uniqueListings=${listingMap.size} listings=${listings.length}`);
   return listings;
 }
