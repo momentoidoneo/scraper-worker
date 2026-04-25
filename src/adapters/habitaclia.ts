@@ -235,8 +235,21 @@ async function scrapeHabitacliaWithProxy(
           return { listings: [], rawNodes: pageNodes, blocked: true };
         }
 
+        const wantsPrivate = normalizeText(params.listing_type) === "particular";
+        const listings = (await collectVisibleListings(page, expectedHrefPart)).map((listing) => {
+          const raw = listing.raw && typeof listing.raw === "object" && !Array.isArray(listing.raw)
+            ? listing.raw as Record<string, unknown>
+            : {};
+          if (!wantsPrivate || listing.listing_type === "agencia" || raw.advertiserHint) return listing;
+          return {
+            ...listing,
+            listing_type: "particular" as const,
+            raw: { ...raw, privateSearch: true },
+          };
+        });
+
         return {
-          listings: await collectVisibleListings(page, expectedHrefPart),
+          listings,
           rawNodes: pageNodes,
           blocked: false,
         };

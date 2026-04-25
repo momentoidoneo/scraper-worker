@@ -327,9 +327,14 @@ async function scrapeFotocasaWithProxy(
             const raw = listing.raw && typeof listing.raw === "object" && !Array.isArray(listing.raw)
               ? listing.raw as Record<string, unknown>
               : {};
+            const wantsPrivate = normalizeText(params.listing_type) === "particular";
+            const listingType = wantsPrivate && listing.listing_type !== "agencia" && !raw.advertiserHint
+              ? "particular"
+              : listing.listing_type;
             const enrichedListing = {
               ...listing,
-              raw: { ...raw, searchSegment: segment.label },
+              listing_type: listingType,
+              raw: { ...raw, searchSegment: segment.label, privateSearch: wantsPrivate || undefined },
             };
             const existing = segmentMap.get(listing.external_id);
             if (!existing || listingQualityScore(enrichedListing) > listingQualityScore(existing)) {
