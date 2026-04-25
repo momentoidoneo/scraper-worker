@@ -111,7 +111,7 @@ async function scrapeHabitacliaWithProxy(
       const detectListingType = (value: string) => {
         const text = normalizeText(value);
         if (/\b(particular|propietario|private|privado)\b/.test(text)) return "particular";
-        if (/\b(inmobiliaria|agencia|agency|professional|profesional|promotor|promotora|real estate|properties|habitaclia)\b/.test(text)) return "agencia";
+        if (/\b(inmobiliaria|agencia|agency|professional|profesional|promotor|promotora|real estate|properties)\b/.test(text)) return "agencia";
         return null;
       };
       const publishedAt = (value: string) => {

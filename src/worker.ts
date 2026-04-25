@@ -4,6 +4,7 @@ import { ingestResults } from "./ingest.js";
 import { scrapeIdealista } from "./adapters/idealista.js";
 import { scrapeFotocasa } from "./adapters/fotocasa.js";
 import { scrapeHabitaclia } from "./adapters/habitaclia.js";
+import { enrichListingType } from "./lib/listing-classifier.js";
 import { normalizeSearchParams, type RawSearchParams } from "./lib/url-builder.js";
 import { recordJobDone } from "./heartbeat.js";
 
@@ -267,9 +268,45 @@ function finalListingType(result: ScrapedListing, params: ReturnType<typeof norm
   return desired ?? result.listing_type ?? null;
 }
 
-function applySearchFilters(results: ScrapedListing[], params: ReturnType<typeof normalizeSearchParams>): ScrapedListing[] {
+async function enrichListingTypesForFilter(
+  results: ScrapedListing[],
+  params: ReturnType<typeof normalizeSearchParams>,
+  portal: string,
+): Promise<ScrapedListing[]> {
+  const desired = canonicalListingType(params.listing_type);
+  const requestedText = normalizeText(params.listing_type);
+  if (!desired || requestedText === "ambos" || requestedText === "any" || requestedText === "todos") {
+    return results;
+  }
+
+  const enriched: ScrapedListing[] = [];
+  const stats: Record<string, number> = {};
+  for (const result of results) {
+    const classified = await enrichListingType(result);
+    const raw = asRecord(classified.raw);
+    const classification = asRecord(raw?._listingTypeClassification);
+    const source = String(classification?.source ?? "none");
+    const listingType = String(classification?.listing_type ?? "none");
+    const key = `${source}:${listingType}`;
+    stats[key] = (stats[key] ?? 0) + 1;
+    enriched.push(classified);
+  }
+
+  if (results.length) {
+    console.log(`[classifier] portal=${portal} requested=${desired} stats=${JSON.stringify(stats)}`);
+  }
+
+  return enriched;
+}
+
+async function applySearchFilters(
+  results: ScrapedListing[],
+  params: ReturnType<typeof normalizeSearchParams>,
+  portal: string,
+): Promise<ScrapedListing[]> {
+  const enrichedResults = await enrichListingTypesForFilter(results, params, portal);
   const rejected: Record<string, number> = {};
-  const filtered = results.filter((result) => {
+  const filtered = enrichedResults.filter((result) => {
     const reason = rejectionReason(result, params);
     if (reason) {
       rejected[reason] = (rejected[reason] ?? 0) + 1;
@@ -310,7 +347,7 @@ export function startWorker() {
               adapters[portal](params),
               new Promise<never>((_, rej) => setTimeout(() => rej(new Error("portal_timeout")), TIMEOUT)),
             ]);
-            const filteredResults = applySearchFilters(results as ScrapedListing[], params);
+            const filteredResults = await applySearchFilters(results as ScrapedListing[], params, portal);
             if (filteredResults.length !== results.length) {
               console.log(`[worker] portal=${portal} filtered ${results.length} -> ${filteredResults.length}`);
             }
