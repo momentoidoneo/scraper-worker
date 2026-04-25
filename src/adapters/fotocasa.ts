@@ -151,7 +151,7 @@ async function collectVisibleListings(page: Page): Promise<Listing[]> {
         bathrooms: firstNumber(text, /(\d+)\s*baños?/i),
         images,
         property_type: detectPropertyType(title + " " + href + " " + text),
-        listing_type: detectListingType(title + " " + href + " " + text + advertiserHint),
+        listing_type: advertiserHint ? "agencia" : detectListingType(title + " " + href + " " + text),
         published_at: publishedAt(text),
         raw: { textPreview: text.slice(0, 1200), advertiserHint: advertiserHint.trim() || null },
       });
