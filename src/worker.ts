@@ -6,6 +6,7 @@ import { scrapeFotocasa } from "./adapters/fotocasa.js";
 import { scrapeHabitaclia } from "./adapters/habitaclia.js";
 import { enrichListingType } from "./lib/listing-classifier.js";
 import { enrichListingDetailsForPrivateSearch } from "./lib/listing-detail-enricher.js";
+import { enrichOpportunityBatch } from "./lib/opportunity-ai.js";
 import { normalizeSearchParams, type RawSearchParams } from "./lib/url-builder.js";
 import { recordJobDone } from "./heartbeat.js";
 
@@ -393,7 +394,7 @@ export function startWorker() {
             if (filteredResults.length !== results.length) {
               console.log(`[worker] portal=${portal} filtered ${results.length} -> ${filteredResults.length}`);
             }
-            const enrichedResults = filteredResults.map((r) => ({
+            const normalizedResults = filteredResults.map((r) => ({
               ...r,
               property_type: finalPropertyType(r, params),
               listing_type: finalListingType(r, params),
@@ -401,6 +402,7 @@ export function startWorker() {
               city: r.city ?? params.city,
               zone: r.zone ?? params.zones[0] ?? null,
             }));
+            const enrichedResults = await enrichOpportunityBatch(normalizedResults);
             progress[portal].status = "done";
             progress[portal].count = enrichedResults.length;
             await ingestResults({ jobId, tenantId, results: enrichedResults, progress, status: "running" });
