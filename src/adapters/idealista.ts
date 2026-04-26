@@ -42,9 +42,9 @@ function requiredToken(): string {
 }
 
 function desiredResults(): number {
-  const parsed = Number.parseInt(process.env.APIFY_IDEALISTA_DESIRED_RESULTS ?? "100", 10);
-  if (!Number.isFinite(parsed)) return 100;
-  return Math.max(10, Math.min(parsed, 100));
+  const parsed = Number.parseInt(process.env.APIFY_IDEALISTA_DESIRED_RESULTS ?? "180", 10);
+  if (!Number.isFinite(parsed)) return 180;
+  return Math.max(10, Math.min(parsed, 240));
 }
 
 function segmentedSearchEnabled(): boolean {
@@ -53,7 +53,11 @@ function segmentedSearchEnabled(): boolean {
 }
 
 function apifyConcurrency(totalSearches: number): number {
-  return Math.min(totalSearches, envInt("APIFY_IDEALISTA_CONCURRENCY", 2, 1, 6));
+  return Math.min(totalSearches, envInt("APIFY_IDEALISTA_CONCURRENCY", 3, 1, 6));
+}
+
+function maxResultsPerSearch(): number {
+  return envInt("APIFY_IDEALISTA_MAX_RESULTS_PER_SEARCH", 100, 10, 100);
 }
 
 function priceBandsFor(operation: string): Array<{ price_min?: number; price_max?: number }> {
@@ -93,8 +97,10 @@ function intersectPriceBand(
 }
 
 function searchUrls(params: SearchParams, totalDesiredResults: number): Array<{ url: string; desiredResults: number }> {
+  const maxPerSearch = maxResultsPerSearch();
+
   if (!segmentedSearchEnabled() || totalDesiredResults < 30) {
-    return [{ url: buildIdealistaUrl(params), desiredResults: totalDesiredResults }];
+    return [{ url: buildIdealistaUrl(params), desiredResults: Math.min(totalDesiredResults, maxPerSearch) }];
   }
 
   const segments = priceBandsFor(params.operation)
@@ -102,10 +108,10 @@ function searchUrls(params: SearchParams, totalDesiredResults: number): Array<{ 
     .filter((band): band is { price_min?: number; price_max?: number } => Boolean(band));
 
   if (segments.length <= 1) {
-    return [{ url: buildIdealistaUrl(params), desiredResults: totalDesiredResults }];
+    return [{ url: buildIdealistaUrl(params), desiredResults: Math.min(totalDesiredResults, maxPerSearch) }];
   }
 
-  const perSegment = Math.max(10, Math.ceil(totalDesiredResults / segments.length));
+  const perSegment = Math.min(maxPerSearch, Math.max(10, Math.ceil(totalDesiredResults / segments.length)));
   return segments.map((segment) => ({
     url: buildIdealistaUrl({ ...params, ...segment }),
     desiredResults: perSegment,
