@@ -328,7 +328,7 @@ async function ollamaOpportunity(listing: OpportunityListing, base: OpportunityA
       ...base,
       source: "ollama_fallback",
       model,
-      risks: [...base.risks, `Ollama no disponible: ${err instanceof Error ? err.message : String(err)}`].slice(0, 5),
+      signals: [...base.signals, `análisis IA por reglas: ${err instanceof Error ? err.message : String(err)}`].slice(0, 8),
     };
   } finally {
     clearTimeout(timeout);
