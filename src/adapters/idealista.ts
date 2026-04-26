@@ -27,6 +27,12 @@ const ACTOR_ID = process.env.APIFY_IDEALISTA_ACTOR_ID?.trim() || "dz_omar~ideali
 const STANDBY_URL = process.env.APIFY_IDEALISTA_STANDBY_URL?.trim() || "";
 const REQUEST_TIMEOUT = Number.parseInt(process.env.APIFY_IDEALISTA_TIMEOUT_MS ?? "240000", 10);
 
+function envInt(name: string, fallback: number, min: number, max: number): number {
+  const parsed = Number.parseInt(process.env[name] ?? String(fallback), 10);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(min, Math.min(parsed, max));
+}
+
 function requiredToken(): string {
   const token = process.env.APIFY_TOKEN?.trim() || process.env.APIFY_API_TOKEN?.trim();
   if (!token) {
@@ -44,6 +50,10 @@ function desiredResults(): number {
 function segmentedSearchEnabled(): boolean {
   const value = (process.env.APIFY_IDEALISTA_SEGMENTED_SEARCH ?? "true").trim().toLowerCase();
   return !["0", "false", "no", "off"].includes(value);
+}
+
+function apifyConcurrency(totalSearches: number): number {
+  return Math.min(totalSearches, envInt("APIFY_IDEALISTA_CONCURRENCY", 2, 1, 6));
 }
 
 function priceBandsFor(operation: string): Array<{ price_min?: number; price_max?: number }> {
@@ -283,18 +293,32 @@ export async function scrapeIdealista(params: SearchParams): Promise<Listing[]> 
   const targetResults = desiredResults();
   const searches = searchUrls(params, targetResults);
   const seenListings = new Set<string>();
-  const searchListings: Listing[][] = [];
+  const searchItems: ApifyItem[][] = Array.from({ length: searches.length }, () => []);
   let itemCount = 0;
+  let nextSearchIndex = 0;
 
-  console.log(`[idealista] apify actor=${ACTOR_ID} searches=${searches.length} desiredTotal=${targetResults}`);
-  for (const search of searches) {
-    const payload = {
-      Property_urls: [{ url: search.url }],
-      desiredResults: search.desiredResults,
-    };
+  const concurrency = apifyConcurrency(searches.length);
+  console.log(`[idealista] apify actor=${ACTOR_ID} searches=${searches.length} concurrency=${concurrency} desiredTotal=${targetResults}`);
+  const workers = Array.from({ length: concurrency }, async () => {
+    while (true) {
+      const searchIndex = nextSearchIndex;
+      nextSearchIndex += 1;
+      if (searchIndex >= searches.length) return;
 
-    console.log(`[idealista] apify url=${search.url} desiredResults=${payload.desiredResults}`);
-    const items = await fetchApifyItems(payload, token);
+      const search = searches[searchIndex];
+      const payload = {
+        Property_urls: [{ url: search.url }],
+        desiredResults: search.desiredResults,
+      };
+
+      console.log(`[idealista] apify url=${search.url} desiredResults=${payload.desiredResults}`);
+      searchItems[searchIndex] = await fetchApifyItems(payload, token);
+    }
+  });
+
+  await Promise.all(workers);
+
+  const searchListings: Listing[][] = searchItems.map((items) => {
     itemCount += items.length;
     const listingsForSearch: Listing[] = [];
     for (const item of items) {
@@ -305,8 +329,8 @@ export async function scrapeIdealista(params: SearchParams): Promise<Listing[]> 
       seenListings.add(key);
       listingsForSearch.push(listing);
     }
-    searchListings.push(listingsForSearch);
-  }
+    return listingsForSearch;
+  });
 
   const listings: Listing[] = [];
   for (let index = 0; listings.length < targetResults; index += 1) {
